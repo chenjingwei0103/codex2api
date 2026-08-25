@@ -239,6 +239,9 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 	if mappedModel != "" {
 		model = mappedModel
 	}
+	if h.codexTuiUDSEnabled() {
+		return h.executeResponsesWSViaCodexTuiUDS(c, conn, rawBody, model)
+	}
 	logModel := requestModel
 	if logModel == "" {
 		logModel = model

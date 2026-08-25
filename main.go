@@ -373,6 +373,13 @@ func main() {
 	deviceCfg := proxy.DeviceProfileConfigFromEnv(os.Getenv)
 	handler := proxy.NewHandler(store, db, cfg, deviceCfg)
 	handler.SetRuntimeCache(tc)
+	tuiUDS, err := proxy.StartCodexTuiUDS(cfg)
+	if err != nil {
+		log.Fatalf("Codex TUI UDS start failed: %v", err)
+	}
+	if tuiUDS != nil {
+		defer tuiUDS.Close()
+	}
 
 	// 注册 WebSocket 执行函数（避免 proxy ↔ wsrelay 循环依赖）
 	proxy.WebsocketExecuteFunc = wsrelay.ExecuteRequestWebsocket
@@ -542,6 +549,12 @@ func main() {
 	log.Printf("  账号自助: http://%s:%d/account-portal", displayHost, cfg.Port)
 	log.Printf("  API:    POST /v1/chat/completions")
 	log.Printf("  API:    POST /v1/responses")
+	if cfg.CodexTuiUDSEnabled {
+		log.Printf("  TUI UDS backend: %s", cfg.CodexTuiUDSBackend)
+		if cfg.CodexTuiUDSListen != "" {
+			log.Printf("  TUI UDS listen:  %s", cfg.CodexTuiUDSListen)
+		}
+	}
 	log.Printf("  API:    POST /v1/images/generations")
 	log.Printf("  API:    POST /v1/images/jobs")
 	log.Printf("  API:    GET  /v1/images/jobs/:id")

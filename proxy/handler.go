@@ -2853,6 +2853,19 @@ func (h *Handler) Responses(c *gin.Context) {
 	rawBody, _ = normalizePortableResponsesCompactionHistory(rawBody)
 	setRawRequestBody(c, rawBody)
 
+	if h.codexTuiUDSEnabled() {
+		model := strings.TrimSpace(mappedModel)
+		if model == "" {
+			model = strings.TrimSpace(gjson.GetBytes(rawBody, "model").String())
+		}
+		if model == "" {
+			api.SendMissingFieldError(c, "model")
+			return
+		}
+		h.executeResponsesViaCodexTuiUDS(c, rawBody, model, gjson.GetBytes(rawBody, "stream").Bool())
+		return
+	}
+
 	// Validate request
 	validator := api.NewValidator(rawBody)
 	rules := api.ResponsesAPIValidationRulesForModel(mappedModel)
@@ -4367,6 +4380,19 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 	rawBody, _ = normalizePortableResponsesCompactionHistory(rawBody)
 	setRawRequestBody(c, rawBody)
 
+	if h.codexTuiUDSEnabled() {
+		model := strings.TrimSpace(mappedModel)
+		if model == "" {
+			model = strings.TrimSpace(gjson.GetBytes(rawBody, "model").String())
+		}
+		if model == "" {
+			api.SendMissingFieldError(c, "model")
+			return
+		}
+		h.executeResponsesViaCodexTuiUDS(c, rawBody, model, gjson.GetBytes(rawBody, "stream").Bool())
+		return
+	}
+
 	// Validate request
 	validator := api.NewValidator(rawBody)
 	rules := api.ResponsesAPIValidationRulesForModel(mappedModel)
@@ -5049,6 +5075,22 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 
 	supportedModels := h.supportedModelIDs(c.Request.Context())
 	rawBody, requestModel, mappedModel, mappingApplied := h.applyConfiguredModelMappingToBody(rawBody, supportedModels)
+
+	if h.codexTuiUDSEnabled() {
+		model := strings.TrimSpace(mappedModel)
+		if model == "" {
+			model = strings.TrimSpace(gjson.GetBytes(rawBody, "model").String())
+		}
+		if model == "" {
+			model = "gpt-5.5"
+		}
+		codexBody, err := TranslateRequest(rawBody)
+		if err != nil || len(responsesBodyToTuiInput(codexBody)) == 0 {
+			codexBody = rawBody
+		}
+		h.executeChatCompletionsViaCodexTuiUDS(c, codexBody, model, gjson.GetBytes(rawBody, "stream").Bool())
+		return
+	}
 
 	// Validate request
 	validator := api.NewValidator(rawBody)

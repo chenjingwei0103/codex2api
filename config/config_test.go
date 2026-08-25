@@ -448,3 +448,55 @@ func TestApplyTimezoneKeepsLocalOnInvalidTZ(t *testing.T) {
 		t.Fatalf("非法 TZ 不应改动 time.Local, got %q", time.Local)
 	}
 }
+
+func TestLoadCodexTuiUDSConfig(t *testing.T) {
+	t.Setenv("DATABASE_DRIVER", "")
+	t.Setenv("DATABASE_HOST", "postgres")
+	t.Setenv("CACHE_DRIVER", "")
+	t.Setenv("REDIS_ADDR", "redis:6379")
+	t.Setenv("CODEX_TUI_UDS_ENABLED", "true")
+	t.Setenv("CODEX_TUI_UDS_LISTEN", "off")
+	t.Setenv("CODEX_TUI_UDS_BACKEND", "")
+	t.Setenv("CODEX_TUI_UDS_HOME", "")
+	t.Setenv("CODEX_TUI_UDS_SPAWN", "true")
+
+	cfg, err := Load("__not_exists__.env")
+	if err != nil {
+		t.Fatalf("Load() error: %v", err)
+	}
+	if !cfg.CodexTuiUDSEnabled {
+		t.Fatal("CodexTuiUDSEnabled = false, want true")
+	}
+	if cfg.CodexTuiUDSListen != "" {
+		t.Fatalf("CodexTuiUDSListen = %q, want empty", cfg.CodexTuiUDSListen)
+	}
+	if cfg.CodexTuiUDSBackend == "" {
+		t.Fatal("CodexTuiUDSBackend is empty")
+	}
+	if cfg.CodexTuiUDSHome == "" {
+		t.Fatal("CodexTuiUDSHome is empty")
+	}
+	if !cfg.CodexTuiUDSSpawn {
+		t.Fatal("CodexTuiUDSSpawn = false, want true")
+	}
+}
+
+func TestLoadCodexTuiUDSConfigDefaultListen(t *testing.T) {
+	t.Setenv("DATABASE_DRIVER", "")
+	t.Setenv("DATABASE_HOST", "postgres")
+	t.Setenv("CACHE_DRIVER", "")
+	t.Setenv("REDIS_ADDR", "redis:6379")
+	t.Setenv("CODEX_TUI_UDS_ENABLED", "true")
+	t.Setenv("CODEX_TUI_UDS_LISTEN", "")
+	t.Setenv("CODEX_TUI_UDS_BACKEND", "")
+	t.Setenv("CODEX_TUI_UDS_HOME", "")
+	t.Setenv("CODEX_TUI_UDS_SPAWN", "true")
+
+	cfg, err := Load("__not_exists__.env")
+	if err != nil {
+		t.Fatalf("Load() error: %v", err)
+	}
+	if cfg.CodexTuiUDSListen != DefaultCodexTuiUDSListenPath() {
+		t.Fatalf("CodexTuiUDSListen = %q, want default %q", cfg.CodexTuiUDSListen, DefaultCodexTuiUDSListenPath())
+	}
+}
