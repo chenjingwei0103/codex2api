@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -100,6 +101,13 @@ type Config struct {
 	UseWebsocket           bool     // 是否启用 WebSocket 传输
 	CodexUpstreamTransport string   // http|auto|ws，默认 http；USE_WEBSOCKET 作为旧开关兼容
 	TrustedProxies         []string // Gin 可信反向代理 CIDR/IP；默认信任回环与私有网段以兼容 Docker 反代，none/off/false/0 表示禁用
+	// Codex TUI Unix socket 上游：Codex App -> Codex2API -> Codex TUI (UDS) -> OpenAI。
+	// 开启后 /v1/responses 不再用 Go HTTP/uTLS 直连 chatgpt.com，改走官方 TUI 的 rustls 客户端。
+	CodexTuiUDSEnabled bool
+	CodexTuiUDSListen  string // Codex2API 监听的 app-server 控制套接字，供 Codex App 连接
+	CodexTuiUDSHome    string // spawn TUI CODEX_HOME
+	CodexTuiUDSBackend string // 真实 Codex TUI/app-server 套接字
+	CodexTuiUDSSpawn   bool   // 后端套接字不存在时尝试 spawn codex app-server --listen unix://
 }
 
 // applyTimezone 让 TZ 环境变量(含 .env 里的)真正作用于自然日限额等本地时间语义。
@@ -166,6 +174,26 @@ func Load(envPath string) (*Config, error) {
 	}
 	if cfg.CodexUpstreamTransport == "ws" {
 		cfg.UseWebsocket = true
+	}
+
+	cfg.CodexTuiUDSEnabled = parseBoolEnv(os.Getenv("CODEX_TUI_UDS_ENABLED"))
+	cfg.CodexTuiUDSListen = strings.TrimSpace(os.Getenv("CODEX_TUI_UDS_LISTEN"))
+	cfg.CodexTuiUDSBackend = strings.TrimSpace(os.Getenv("CODEX_TUI_UDS_BACKEND"))
+	cfg.CodexTuiUDSHome = strings.TrimSpace(os.Getenv("CODEX_TUI_UDS_HOME"))
+	cfg.CodexTuiUDSSpawn = parseBoolEnv(os.Getenv("CODEX_TUI_UDS_SPAWN"))
+	if cfg.CodexTuiUDSEnabled {
+		if cfg.CodexTuiUDSBackend == "" {
+			cfg.CodexTuiUDSBackend = DefaultCodexTuiUDSBackendPath()
+		}
+		switch strings.ToLower(cfg.CodexTuiUDSListen) {
+		case "off", "none", "false", "0":
+			cfg.CodexTuiUDSListen = ""
+		case "":
+			cfg.CodexTuiUDSListen = DefaultCodexTuiUDSListenPath()
+		}
+		if cfg.CodexTuiUDSHome == "" {
+			cfg.CodexTuiUDSHome = DefaultCodexTuiUDSHomePath()
+		}
 	}
 
 	// 数据库配置
@@ -285,4 +313,38 @@ func normalizeCodexUpstreamTransport(value string) string {
 	default:
 		return ""
 	}
+}
+
+// DefaultCodexTuiUDSBackendPath 是官方 Codex TUI/app-server 控制套接字。
+// 不要让 Codex2API 监听这个路径，否则会和正在运行的 Codex App 抢 socket。
+func DefaultCodexTuiUDSBackendPath() string {
+	return filepath.Join(codex2apiHomeDir(), "tui-backend.sock")
+}
+
+// DefaultCodexTuiUDSListenPath 是 Codex2API 自己的 app-server 套接字，供 Codex App 连接。
+func DefaultCodexTuiUDSListenPath() string {
+	return filepath.Join(codex2apiHomeDir(), "app-server-control.sock")
+}
+
+func DefaultCodexTuiUDSHomePath() string {
+	return filepath.Join(codex2apiHomeDir(), "tui-home")
+}
+
+func OfficialCodexTuiUDSBackendPath() string {
+	if home := strings.TrimSpace(os.Getenv("CODEX_HOME")); home != "" {
+		return filepath.Join(home, "app-server-control", "app-server-control.sock")
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+	return filepath.Join(home, ".codex", "app-server-control", "app-server-control.sock")
+}
+
+func codex2apiHomeDir() string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return ".codex2api"
+	}
+	return filepath.Join(home, ".codex2api")
 }
