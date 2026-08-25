@@ -1,0 +1,20 @@
+[Unit]
+Description=Codex app-server (Unix socket)
+After=network.target
+
+[Service]
+Type=simple
+User=root
+Group=root
+RuntimeDirectory=codex
+RuntimeDirectoryMode=0700
+Environment=HOME=/root
+Environment=CODEX_HOME=/root/.codex
+WorkingDirectory=/opt/codex-workspace
+ExecStart=/usr/local/bin/codex app-server --listen unix:///run/codex/app-server.sock
+Restart=always
+RestartSec=2
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target

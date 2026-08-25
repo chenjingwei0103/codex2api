@@ -1,0 +1,28 @@
+name: codex2api-sqlite-uds
+
+services:
+  codex2api:
+    build: .
+    image: codex2api-uds:local
+    container_name: codex2api-sqlite-uds
+    ports:
+      - "${BIND_HOST:-0.0.0.0}:${CODEX_PORT:-8080}:${CODEX_PORT:-8080}"
+    env_file:
+      - .env
+    environment:
+      CODEX_UPSTREAM_TRANSPORT: uds
+      CODEX_APP_SERVER_SOCKET: /run/codex/app-server.sock
+      CODEX_APP_SERVER_CWD: /opt/codex-workspace
+      DATABASE_DRIVER: sqlite
+      CACHE_DRIVER: memory
+      DATABASE_PATH: /data/codex2api.db
+      BIND_HOST: 0.0.0.0
+    volumes:
+      - sqlite-data:/data
+      - ./logs:/app/logs
+      - /run/codex:/run/codex
+    restart: unless-stopped
+
+volumes:
+  sqlite-data:
+    name: codex2api-sqlite-uds_sqlite-data

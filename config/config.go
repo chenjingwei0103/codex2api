@@ -108,6 +108,8 @@ type Config struct {
 	CodexTuiUDSHome    string // spawn TUI CODEX_HOME
 	CodexTuiUDSBackend string // 真实 Codex TUI/app-server 套接字
 	CodexTuiUDSSpawn   bool   // 后端套接字不存在时尝试 spawn codex app-server --listen unix://
+	CodexAppServerSocket string // CODEX_APP_SERVER_SOCKET
+	CodexAppServerCwd    string // CODEX_APP_SERVER_CWD
 }
 
 // applyTimezone 让 TZ 环境变量(含 .env 里的)真正作用于自然日限额等本地时间语义。
@@ -181,6 +183,8 @@ func Load(envPath string) (*Config, error) {
 	cfg.CodexTuiUDSBackend = strings.TrimSpace(os.Getenv("CODEX_TUI_UDS_BACKEND"))
 	cfg.CodexTuiUDSHome = strings.TrimSpace(os.Getenv("CODEX_TUI_UDS_HOME"))
 	cfg.CodexTuiUDSSpawn = parseBoolEnv(os.Getenv("CODEX_TUI_UDS_SPAWN"))
+	cfg.CodexAppServerSocket = strings.TrimSpace(os.Getenv("CODEX_APP_SERVER_SOCKET"))
+	cfg.CodexAppServerCwd = strings.TrimSpace(os.Getenv("CODEX_APP_SERVER_CWD"))
 	if cfg.CodexTuiUDSEnabled {
 		if cfg.CodexTuiUDSBackend == "" {
 			cfg.CodexTuiUDSBackend = DefaultCodexTuiUDSBackendPath()
@@ -310,6 +314,8 @@ func normalizeCodexUpstreamTransport(value string) string {
 		return "auto"
 	case "ws", "websocket", "wss":
 		return "ws"
+	case "uds", "unix", "unix-socket":
+		return "uds"
 	default:
 		return ""
 	}
