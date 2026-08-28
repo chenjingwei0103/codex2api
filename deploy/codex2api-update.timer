@@ -1,0 +1,11 @@
+[Unit]
+Description=Daily Codex2API source update
+
+[Timer]
+OnCalendar=*-*-* 04:00:00
+Persistent=true
+RandomizedDelaySec=15min
+Unit=codex2api-update.service
+
+[Install]
+WantedBy=timers.target

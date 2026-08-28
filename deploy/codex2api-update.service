@@ -1,0 +1,12 @@
+[Unit]
+Description=Update and rebuild Codex2API from origin/main
+After=network-online.target docker.service
+Wants=network-online.target
+ConditionPathExists=/opt/codex2api/.git
+
+[Service]
+Type=oneshot
+User=root
+WorkingDirectory=/opt/codex2api
+ExecStart=/opt/codex2api/deploy/codex2api-update.sh
+TimeoutStartSec=30min
