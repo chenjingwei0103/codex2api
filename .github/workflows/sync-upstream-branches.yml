@@ -70,6 +70,11 @@ jobs:
           done < <(git for-each-ref --format='%(refname:strip=3)' refs/remotes/origin)
 
           if ((${#conflicts[@]} > 0)); then
+            printf 'Branches requiring manual conflict resolution: %s\n' "${conflicts[*]}" >&2
+            exit 1
+          fi
+
+          if ((${#conflicts[@]} > 0)); then
             printf 'Branches requiring manual conflict resolution: %s\n' "${conflicts[*]}"
             exit 1
           fi
