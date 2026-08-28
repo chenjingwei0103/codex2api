@@ -157,9 +157,28 @@ func (h *Handler) grokBillingModelIDs() []string {
 
 // modelPricingRow 是定价管理页每个规范模型的一行：当前生效价 + 来源。
 type modelPricingRow struct {
-	Model   string                        `json:"model"`
-	Source  string                        `json:"source"` // custom / synced / default
-	Pricing database.ModelPricingOverride `json:"pricing"`
+	Model          string                        `json:"model"`
+	Source         string                        `json:"source"` // custom / synced / default
+	Pricing        database.ModelPricingOverride `json:"pricing"`
+	CanonicalModel string                        `json:"canonical_model,omitempty"`
+	IsAlias        bool                          `json:"is_alias,omitempty"`
+}
+
+func modelPricingManagementKeys(ids []string) []string {
+	seen := make(map[string]struct{}, len(ids))
+	out := make([]string, 0, len(ids))
+	for _, id := range ids {
+		key := database.PricingManagementModelKey(id)
+		if key == "" || strings.Contains(key, "(") {
+			continue
+		}
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		out = append(out, key)
+	}
+	return out
 }
 
 // ListModelPricing 返回各规范模型的当前生效定价与来源，供设置页定价表展示。
@@ -167,14 +186,20 @@ func (h *Handler) ListModelPricing(c *gin.Context) {
 	ctx := c.Request.Context()
 
 	// 取当前对外暴露的模型，映射到规范定价键去重（退役模型自然被排除）。
-	seen := map[string]struct{}{}
 	collect := func(ids []string) []string {
-		out := make([]string, 0, len(ids))
-		for _, id := range ids {
-			key := database.CanonicalBillingModelKey(id)
-			if key == "" || strings.Contains(key, "(") { // 跳过思考强度别名
-				continue
-			}
+		return modelPricingManagementKeys(ids)
+	}
+
+	keys := collect(proxy.SupportedModelIDs(ctx, h.db))
+	// Grok 模型不在 Codex 注册表里，但同样对外暴露、同样按 token 计费，
+	// 单独并进来，否则定价页看不到 grok-4.5 这类模型。
+	seen := make(map[string]struct{}, len(keys))
+	for _, key := range keys {
+		seen[key] = struct{}{}
+	}
+	dedup := func(ids []string) []string {
+		out := make([]string, 0)
+		for _, key := range collect(ids) {
 			if _, ok := seen[key]; ok {
 				continue
 			}
@@ -183,24 +208,26 @@ func (h *Handler) ListModelPricing(c *gin.Context) {
 		}
 		return out
 	}
-
-	keys := collect(proxy.SupportedModelIDs(ctx, h.db))
-	// Grok 模型不在 Codex 注册表里，但同样对外暴露、同样按 token 计费，
-	// 单独并进来，否则定价页看不到 grok-4.5 这类模型。
-	grokKeys := collect(h.grokBillingModelIDs())
+	grokKeys := dedup(h.grokBillingModelIDs())
+	antigravityKeys := dedup(h.antigravityChannelModels())
 
 	// 新版本在前（gpt-5.6 > gpt-5.5 > gpt-5.4 …），避免字典序把旧模型顶到列表顶部。
 	// Grok 单独排序并整体排在 Codex 之后，避免两家版本号交叉穿插。
 	sortModelKeysNewestFirst(keys)
 	sortModelKeysNewestFirst(grokKeys)
+	sortModelKeysNewestFirst(antigravityKeys)
 	keys = append(keys, grokKeys...)
+	keys = append(keys, antigravityKeys...)
 
 	rows := make([]modelPricingRow, 0, len(keys))
 	for _, key := range keys {
+		canonicalModel := database.PricingAliasTarget(key)
 		rows = append(rows, modelPricingRow{
-			Model:   key,
-			Source:  database.ModelPricingSourceFor(key),
-			Pricing: database.ModelPricingOverrideFromPricing(database.GetModelPricing(key), database.ModelPricingSourceFor(key)),
+			Model:          key,
+			Source:         database.ModelPricingSourceFor(key),
+			Pricing:        database.ModelPricingOverrideFromPricing(database.GetModelPricing(key), database.ModelPricingSourceFor(key)),
+			CanonicalModel: canonicalModel,
+			IsAlias:        canonicalModel != "",
 		})
 	}
 
@@ -234,7 +261,7 @@ func (h *Handler) UpdateModelPricing(c *gin.Context) {
 		writeError(c, http.StatusBadRequest, "invalid request body")
 		return
 	}
-	key := database.CanonicalBillingModelKey(strings.TrimSpace(req.Model))
+	key := database.PricingManagementModelKey(strings.TrimSpace(req.Model))
 	if key == "" {
 		writeError(c, http.StatusBadRequest, "model 不能为空")
 		return

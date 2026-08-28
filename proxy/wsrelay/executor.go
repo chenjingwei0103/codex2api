@@ -349,9 +349,12 @@ func (e *Executor) prepareWebsocketHeaders(accessToken string, account *auth.Acc
 	if accountID != "" {
 		headers.Set("Chatgpt-Account-Id", accountID)
 	}
+	// 会话标识头与 HTTP 路径共用同一条装配：真实客户端的 WS 握手头
+	// （codex-rs/core/src/client.rs build_websocket_headers）与 HTTP /responses 同形，
+	// 都是 session-id / thread-id / x-client-request-id，也都不发 Conversation_id。
+	// legacy 档下该函数恢复旧的 Session_id + 清 Conversation_id 行为。
 	if sessionID = strings.TrimSpace(sessionID); sessionID != "" {
-		headers.Set("Session_id", sessionID)
-		headers.Set("Conversation_id", sessionID)
+		proxy.ApplyCodexSessionHeaders(headers, account, sessionID, ginHeaders, true)
 	}
 	for name, value := range account.GetCustomHeaders() {
 		name = strings.TrimSpace(name)

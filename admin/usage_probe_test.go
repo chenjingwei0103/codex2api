@@ -15,6 +15,15 @@ import (
 	"github.com/codex2api/proxy"
 )
 
+func TestProbeUsageSnapshotRejectsAntigravity(t *testing.T) {
+	handler := &Handler{}
+	account := &auth.Account{UpstreamType: auth.UpstreamAntigravity, AccessToken: "google-token"}
+	err := handler.ProbeUsageSnapshot(context.Background(), account)
+	if err == nil || !strings.Contains(err.Error(), "Antigravity") {
+		t.Fatalf("ProbeUsageSnapshot() error = %v, want Antigravity rejection", err)
+	}
+}
+
 func TestShouldMarkUsageProbeAccountError(t *testing.T) {
 	tests := []struct {
 		name       string

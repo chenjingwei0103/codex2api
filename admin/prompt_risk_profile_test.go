@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -93,6 +94,59 @@ func TestPromptRiskProfileDetailRejectsUnknownSubjectType(t *testing.T) {
 	router.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/api/admin/prompt-policy/risk-profiles/person/raw-user-id", nil))
 	if recorder.Code != http.StatusBadRequest {
 		t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+}
+
+func TestPromptRiskProfileListAndDetailExposeActiveLockWithoutAuditHistory(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	db, err := database.New("sqlite", filepath.Join(t.TempDir(), "admin-lock-only-profile.db"))
+	if err != nil {
+		t.Fatalf("database.New: %v", err)
+	}
+	defer db.Close()
+	sessionHash := strings.Repeat("a", 64)
+	if _, _, err := db.LockPromptConversation(t.Context(), database.PromptConversationLockInput{
+		LockKey: strings.Repeat("b", 64), IdentityKind: database.PromptConversationLockIdentityCodexSession,
+		Platform: "codex-local", NewAPIUserID: "apikey:9",
+		SessionFingerprint: strings.Repeat("c", 32), SessionHash: sessionHash,
+		DecisionID: "lock-only-decision", ReasonCode: "terminal_policy_match", LockedAt: time.Now().UTC(),
+	}); err != nil {
+		t.Fatalf("LockPromptConversation: %v", err)
+	}
+
+	h := &Handler{db: db}
+	router := gin.New()
+	router.GET("/api/admin/prompt-policy/risk-profiles", h.ListPromptRiskProfiles)
+	router.GET("/api/admin/prompt-policy/risk-profiles/:subject_type/:subject_key", h.GetPromptRiskProfile)
+
+	listRecorder := httptest.NewRecorder()
+	router.ServeHTTP(listRecorder, httptest.NewRequest(http.MethodGet, "/api/admin/prompt-policy/risk-profiles?subject_type=session&locked_only=true", nil))
+	if listRecorder.Code != http.StatusOK {
+		t.Fatalf("list status=%d body=%s", listRecorder.Code, listRecorder.Body.String())
+	}
+	var list struct {
+		Profiles []database.PromptRiskProfile `json:"profiles"`
+		Total    int                          `json:"total"`
+	}
+	if err := json.Unmarshal(listRecorder.Body.Bytes(), &list); err != nil || list.Total != 1 || len(list.Profiles) != 1 {
+		t.Fatalf("list response=%s err=%v", listRecorder.Body.String(), err)
+	}
+	if list.Profiles[0].HasActivity || list.Profiles[0].ConversationLock == nil || list.Profiles[0].ConversationLock.RestrictionScope != database.PromptConversationRestrictionScopeConversation {
+		t.Fatalf("lock-only list profile=%#v", list.Profiles[0])
+	}
+
+	detailRecorder := httptest.NewRecorder()
+	router.ServeHTTP(detailRecorder, httptest.NewRequest(http.MethodGet, "/api/admin/prompt-policy/risk-profiles/session/"+sessionHash, nil))
+	if detailRecorder.Code != http.StatusOK {
+		t.Fatalf("detail status=%d body=%s", detailRecorder.Code, detailRecorder.Body.String())
+	}
+	var detail struct {
+		Profile    database.PromptRiskProfile `json:"profile"`
+		Events     []database.PromptRiskEvent `json:"events"`
+		EventTotal int                        `json:"event_total"`
+	}
+	if err := json.Unmarshal(detailRecorder.Body.Bytes(), &detail); err != nil || detail.EventTotal != 0 || len(detail.Events) != 0 || detail.Profile.ConversationLock == nil {
+		t.Fatalf("detail response=%s err=%v", detailRecorder.Body.String(), err)
 	}
 }
 

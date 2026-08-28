@@ -3,7 +3,6 @@ package proxy
 import (
 	"context"
 	"fmt"
-	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -596,7 +595,7 @@ func TestExecuteCompactRequestConvergesBodyAndHeaders(t *testing.T) {
 	var capturedBody []byte
 	var capturedHeader http.Header
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		capturedBody, _ = io.ReadAll(r.Body)
+		capturedBody = readUpstreamRequestBody(r)
 		capturedHeader = r.Header.Clone()
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{}`))
@@ -859,9 +858,16 @@ func TestApplyCodexRequestHeadersConvergesForwardedClientRequestID(t *testing.T)
 	if got := req.Header.Get("X-Client-Request-Id"); got != ids.threadID {
 		t.Fatalf("X-Client-Request-Id = %q, want converged thread id %q", got, ids.threadID)
 	}
-	// Session_id 仍归 resolveUpstreamSessionID 管，收敛不得介入。
-	if got := req.Header.Get("Session_id"); got != "upstream-cache-key" {
-		t.Fatalf("Session_id = %q, want the cache key untouched", got)
+	// 出站会话键仍归 resolveUpstreamSessionID 管，收敛默认不得介入
+	// （对齐需显式开 CODEX_SESSION_HEADER_ALIGN_CONVERGED）。头名改成真实形态，
+	// 但取值语义不变。
+	if got := req.Header.Get("Session-Id"); got != "upstream-cache-key" {
+		t.Fatalf("Session-Id = %q, want the cache key untouched", got)
+	}
+	// thread-id 与 x-client-request-id 必须同值：后者已被收敛改写，前者回落到
+	// 未收敛的值就自相矛盾。
+	if got := req.Header.Get("Thread-Id"); got != ids.threadID {
+		t.Fatalf("Thread-Id = %q, want converged thread id %q", got, ids.threadID)
 	}
 	// 下游没发 installation 头，出站也不该有。
 	if got := req.Header.Get("X-Codex-Installation-Id"); got != "" {

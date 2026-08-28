@@ -212,6 +212,23 @@ func TestScopedModelRecordsDoesNotNeedDatabase(t *testing.T) {
 	}
 }
 
+func TestScopedModelsIncludeAntigravityAccounts(t *testing.T) {
+	store := auth.NewStore(nil, nil, &database.SystemSettings{MaxConcurrency: 2})
+	store.AddAccount(&auth.Account{
+		DBID: 99, UpstreamType: auth.UpstreamAntigravity, AccessToken: "google-token", AntigravityProjectID: "project-id",
+		Models: []string{"gemini-3.7-flash-tiered"},
+	})
+	handler := NewHandler(store, nil, nil, nil)
+	models := listScopedModelsForTest(t, handler, &database.APIKeyRow{ID: 7})
+	found := map[string]bool{}
+	for _, model := range models {
+		found[model.ID] = true
+	}
+	if !found["gemini-3.7-flash-low"] || !found["gemini-3.7-flash-medium"] || !found["gemini-3.7-flash-high"] {
+		t.Fatal("projected Antigravity public model missing from /v1/models")
+	}
+}
+
 func TestScopedModelsDeclaredListCannotOverrideCatalogVisibility(t *testing.T) {
 	store := auth.NewStore(nil, nil, &database.SystemSettings{MaxConcurrency: 1})
 	account := &auth.Account{DBID: 1, UpstreamType: auth.UpstreamGrok, APIKey: "xai", Models: []string{"declared-only", "hidden", "visible"}}
