@@ -51,3 +51,6 @@ grok-build-main/
 CLAUDE.md
 .cursor
 diagrams/
+# Local runtime data
+/data/
+/logs/
