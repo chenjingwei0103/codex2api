@@ -39,6 +39,17 @@ func TestIsOAuthProxyBalanceTarget(t *testing.T) {
 			want: true,
 		},
 		{
+			name: "antigravity oauth",
+			row: &database.AccountRow{
+				Type: auth.UpstreamAntigravity,
+				Credentials: map[string]interface{}{
+					"upstream_type": auth.UpstreamAntigravity,
+					"refresh_token": "rt-antigravity",
+				},
+			},
+			want: true,
+		},
+		{
 			name: "codex access token only",
 			row: &database.AccountRow{
 				Type:        "oauth",

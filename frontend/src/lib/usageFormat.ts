@@ -121,20 +121,74 @@ export function isOfficialCostTooNew(
   return now - created < officialCostMinAccountAgeMs
 }
 
-// Codex OAuth/AT 账号的官方 7d 成本来自本地快照。列表打开时快照经常还是空的，
-// 需要重拉 page-stats 直到回补完成（中转/Grok 没有该字段，不要空转）。
+export function supportsOfficialUsage(account: {
+  access_token_type?: string | null
+  openai_responses_api?: boolean
+  grok_api?: boolean
+}): boolean {
+  if (account.openai_responses_api || account.grok_api) return false
+  return (account.access_token_type || '').trim().toLowerCase() !== 'codex_at'
+}
+
+export function officialUsdValue(account: {
+  official_usd?: number | null
+  official_usd_7d?: number | null
+}): number | null {
+  if (typeof account.official_usd === 'number') return account.official_usd
+  if (typeof account.official_usd_7d === 'number') return account.official_usd_7d
+  return null
+}
+
+// Codex OAuth 账号的官方结算成本来自本地快照。列表打开时快照经常还是空的，
+// 需要重拉 page-stats 直到回补完成；codex_at、中转和 Grok 没有该链路，不要空转。
 // official_usage_synced 表示后端已成功同步过但上游没有数据（官方统计有
 // 滞后），这时继续重拉也不会有结果，交给后台小时级探针即可。
 export function needsOfficialCostReload(account: {
   status?: string | null
   created_at?: string | null
+  access_token_type?: string | null
   openai_responses_api?: boolean
   grok_api?: boolean
+  official_usd?: number | null
   official_usd_7d?: number | null
   official_usage_synced?: boolean
 }): boolean {
-  if (account.openai_responses_api || account.grok_api) return false
+  if (!supportsOfficialUsage(account)) return false
   if (isOfficialCostHiddenAccount(account) || isOfficialCostTooNew(account)) return false
   if (account.official_usage_synced) return false
-  return account.official_usd_7d === null || account.official_usd_7d === undefined
+  return officialUsdValue(account) === null
+}
+
+// 列表「官方结算」跟官方统计页同一次同步对齐：把刚刷下来的按天快照全部累加。
+// windowDays > 0 时以上游最新一天为窗口终点截取，避免浏览器时区错一天。
+export function officialUsdFromDailyItems(
+  items: Array<{ day?: string | null; usd?: number | null }>,
+  windowDays = 0,
+): number | null {
+  if (!Array.isArray(items) || items.length === 0) return null
+  let cutoffDay = ''
+  if (windowDays > 0) {
+    const days = items
+      .map((item) => (item.day || '').trim())
+      .filter((day) => /^\d{4}-\d{2}-\d{2}$/.test(day))
+      .sort()
+    const latest = days[days.length - 1]
+    if (!latest) return null
+    const latestDate = new Date(`${latest}T00:00:00Z`)
+    if (Number.isNaN(latestDate.getTime())) return null
+    const cutoff = new Date(latestDate)
+    cutoff.setUTCDate(cutoff.getUTCDate() - (windowDays - 1))
+    cutoffDay = cutoff.toISOString().slice(0, 10)
+  }
+  let usd = 0
+  let any = false
+  for (const item of items) {
+    const day = (item.day || '').trim()
+    if (cutoffDay && day < cutoffDay) continue
+    const value = Number(item.usd)
+    if (!Number.isFinite(value)) continue
+    usd += value
+    any = true
+  }
+  return any ? usd : null
 }

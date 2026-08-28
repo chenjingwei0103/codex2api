@@ -1,0 +1,75 @@
+name: Sync all branches with upstream
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "15 19 * * *"
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Merge upstream main into every fork branch
+        shell: bash
+        env:
+          UPSTREAM_REPOSITORY: https://github.com/james-6-23/codex2api.git
+        run: |
+          set -Eeuo pipefail
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add upstream "$UPSTREAM_REPOSITORY"
+          git fetch --prune upstream main
+          git fetch --prune origin '+refs/heads/*:refs/remotes/origin/*'
+
+          conflicts=()
+          while IFS= read -r branch; do
+            [[ -z "$branch" || "$branch" == "HEAD" ]] && continue
+
+            worktree="$RUNNER_TEMP/codex2api-sync-${branch//\//-}"
+            before_paths="$RUNNER_TEMP/codex2api-sync-${branch//\//-}.paths"
+            git worktree add --detach "$worktree" "origin/$branch"
+            git -C "$worktree" ls-tree -r --name-only HEAD >"$before_paths"
+
+            if ! git -C "$worktree" merge --no-edit upstream/main; then
+              git -C "$worktree" merge --abort || true
+              conflicts+=("$branch")
+              git worktree remove --force "$worktree"
+              continue
+            fi
+
+            missing_path=""
+            while IFS= read -r path; do
+              if ! git -C "$worktree" cat-file -e "HEAD:$path" 2>/dev/null; then
+                missing_path="$path"
+                break
+              fi
+            done <"$before_paths"
+            if [[ -n "$missing_path" ]]; then
+              echo "Skipping $branch: existing path was removed: $missing_path"
+              conflicts+=("$branch")
+              git worktree remove --force "$worktree"
+              continue
+            fi
+
+            if [[ "$(git -C "$worktree" rev-parse HEAD)" != "$(git rev-parse "origin/$branch")" ]]; then
+              git -C "$worktree" push origin "HEAD:refs/heads/$branch"
+            else
+              echo "$branch is already synchronized"
+            fi
+            git worktree remove --force "$worktree"
+          done < <(git for-each-ref --format='%(refname:strip=3)' refs/remotes/origin)
+
+          if ((${#conflicts[@]} > 0)); then
+            printf 'Branches requiring manual conflict resolution: %s\n' "${conflicts[*]}"
+            exit 1
+          fi

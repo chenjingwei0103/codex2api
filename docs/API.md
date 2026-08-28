@@ -36,7 +36,7 @@ Codex2API 提供兼容 OpenAI 风格的 API 接口，同时包含完整的管理
 
 Anthropic `/v1/messages` 仅将官方 `speed:"fast"` 映射为上游 Codex `service_tier:"priority"`；Anthropic 请求侧 `service_tier`（Priority Tier）不在此映射范围内。用量日志的 `service_tier` / `fast` 过滤反映该解析结果。
 
-**Service Tier 语义说明**：请求侧 `fast` / `priority` 会统一以 `priority` 转发上游，其余取值（`auto`/`default`/`flex`/`scale` 等）不转发。用量日志区分三个字段：`requested_service_tier`（客户端请求意图）、`actual_service_tier`（上游回传 Tier，原样取自 `response.completed.response.service_tier`）、`billing_service_tier`（计费采用值，由 Tier 计费策略 `BillingTierPolicy` 决定，默认 `actual`，上游未回传时回退按请求意图计）。注意：在 ChatGPT OAuth / Codex backend 路径上，Fast 由上游服务端路由处理，`service_tier` 不是端到端可校验字段——上游回传 `default` 并不代表 Fast 未生效（openai/codex#14204 官方说明；#494 的交错 A/B 实测在回传 `default` 时仍有约 1.5× 生成吞吐提升）。因此"上游回传 Tier"仅反映上游申报值，不能单独用于判断加速是否生效；`BillingTierPolicy=actual` 下此类请求按标准价计费。
+**Service Tier 语义说明**：请求侧 `fast` / `priority` 会统一以 `priority` 转发上游，其余取值（`auto`/`default`/`flex`/`scale` 等）不转发。用量日志区分三个字段：`requested_service_tier`（客户端请求意图）、`actual_service_tier`（上游回传 Tier，原样取自 `response.completed.response.service_tier`）、`billing_service_tier`（计费采用值，由 Tier 计费策略 `BillingTierPolicy` 决定）。默认 `actual` 以请求 Tier 为上限：上游只可用更便宜档位降低计费，不能把未请求 Fast 的调用抬升为 Fast，也不能用未知档位改变计费；`requested` 始终按请求意图计费。注意：在 ChatGPT OAuth / Codex backend 路径上，Fast 由上游服务端路由处理，`service_tier` 不是端到端可校验字段——上游回传 `default` 并不代表 Fast 未生效（openai/codex#14204 官方说明；#494 的交错 A/B 实测在回传 `default` 时仍有约 1.5× 生成吞吐提升）。因此"上游回传 Tier"仅反映上游申报值，不能单独用于判断加速是否生效。
 
 **Base URL:** `http://localhost:8080` (默认端口)
 
@@ -207,6 +207,8 @@ data: [DONE]
 | previous_response_id | string       | 否   | 上一响应 ID，用于上下文连续                                                                        |
 
 `previous_response_id` 的上下文先查当前进程的有界 L1。已认证请求按 API Key ID 隔离；未配置任何 API Key、显式启用 `CODEX_ALLOW_ANONYMOUS=true` 后放行的请求共用 `anon` 命名空间。Redis 模式在 L1 未命中时可从共享后端重建；后端值未超过重建上限但超过 L1 准入预算时仍可服务本次请求，只是不提升到 L1。Memory 模式没有共享 response context 后备，依赖上下文被判定为超限、已淘汰或缺失时可能返回 HTTP `409 response_context_unavailable`。共享后端暂时不可用且请求依赖该上下文时可能返回 HTTP `503 service_unavailable`。如果账号池存在可用的 relay-style 后备，网关可保留原始 `previous_response_id` 继续转发，而不是立即返回上述错误。客户端原生 Responses WebSocket 入口不执行这次本地查找，会保留 `previous_response_id` 交给上游。
+
+原生 WebSocket 入口为 `GET /v1/responses`。通过校验与 API Key 限制后，较新的同 API Key、同渠道/分组路由作用域、同会话请求会抢占仍在运行的旧请求，并先取消旧上游以释放账号与并发位。`stream_id` 是抢占键的一部分，因此多路复用的不同流互不影响；不同 API Key 或不同路由作用域也不会互相取消。只有 `prompt_cache_key`、显式会话头、`previous_response_id`、turn state、专用 affinity key 或可稳定派生的内容会话存在时才启用，纯 API Key 兜底身份不会把无关请求合并。Redis 模式支持跨实例抢占，Memory 模式仅在当前进程内生效。
 
 **响应示例:**
 
@@ -752,6 +754,54 @@ Grok 账号编辑页支持账号级模型映射，可让只请求 GPT 模型名�
   "models": ["grok-4.5"]
 }
 ```
+
+### Antigravity credential and state administration
+
+Every endpoint in this section is registered under the existing `/api/admin` authentication middleware and requires the configured admin secret.
+
+#### GET /api/admin/accounts/antigravity/export
+
+Downloads active Antigravity credentials. Optional `ids=1,2` selects accounts; omitting it exports all active Antigravity accounts. A single match returns `application/json; charset=utf-8`; multiple matches return `application/zip`, one sanitized-name JSON member per account. Responses set `Content-Disposition: attachment`, `X-Export-Count` to the actual number of exported credentials, `Cache-Control: no-store, max-age=0`, `Pragma: no-cache`, and `X-Content-Type-Options: nosniff`. No match (including a wrong-channel-only selection) returns `404`.
+
+The response is intentionally secret-bearing and is accepted by the Antigravity batch importer for backup restoration. OAuth JSON includes usable access/refresh/ID tokens and OAuth client metadata. API-key JSON explicitly includes `auth_kind: "api_key"`, `api_key`, declared models, model mapping, and the exported enabled state. Never log, cache, or expose this download to non-admin callers.
+
+#### GET /api/admin/accounts/:id/antigravity/state
+
+Returns persisted sanitized state without an upstream call:
+
+```json
+{
+  "account_id": 42,
+  "credential_generation": 3,
+  "credential_kind": "api_key",
+  "catalog": {
+    "models": ["gemini-2.5-flash"],
+    "source": "declared",
+    "verified": false,
+    "synchronized": true
+  },
+  "identity": {
+    "status": "not_applicable",
+    "email_verified": false,
+    "subject_known": false,
+    "project_status": "not_applicable"
+  },
+  "capabilities": [],
+  "warnings": ["API-key catalog is local and unverified; run an explicit capability probe before claiming Interactions compatibility"]
+}
+```
+
+OAuth state can additionally include sanitized `permissions`, `quota`, project status/ID, synchronization timestamps, and explicit capability observations. Tokens, client secrets, and API keys are never returned.
+
+#### POST /api/admin/accounts/:id/antigravity/sync
+
+OAuth accounts refresh/synchronize the read-only Google identity, project, entitlement, quota, and model control plane. API-key accounts perform no remote catalog/control-plane verification; the response uses `remote: false`, `verified: false`, and `catalog_source: "declared"` or `"default"`.
+
+#### POST /api/admin/accounts/:id/antigravity/capabilities/probe
+
+Explicitly performs one bounded non-stream generation request against the first configured/default model and persists the result under the current credential generation. This action consumes minimal generation quota and never runs during ordinary state reads or sync. API-key Interactions compatibility is `verified: true` only after a successful HTTP response with a valid JSON content type/envelope. Error responses return a sanitized observation/warning without tokens or keys.
+
+Wrong-channel accounts return `400`; missing accounts return `404`; a concurrent credential generation change returns `409`.
 
 #### POST /api/admin/accounts
 
@@ -1463,12 +1513,19 @@ curl -X DELETE "http://localhost:8080/api/admin/account-groups/1?force=true" \
   "auto_clean_rate_limited": false,
   "auto_clean_full_usage": false,
   "auto_clean_error": false,
+  "auto_activate_5h_window_enabled": false,
   "proxy_pool_enabled": false,
   "fast_scheduler_enabled": false,
-  "max_retries": 3,
-  "max_rate_limit_retries": 2,
+  "max_retries": 2,
+  "max_rate_limit_retries": 1,
   "retry_interval_ms": 0,
   "transport_retry_policy": "rotate",
+  "continuous_retry_enabled": false,
+  "continuous_retry_catch_all": false,
+  "continuous_retry_categories": ["transport", "http_429", "http_5xx", "stream_error"],
+  "continuous_retry_status_codes": [],
+  "continuous_retry_error_codes": [],
+  "continuous_retry_max_duration_seconds": 600,
   "codex_fingerprint_default_mode": "off",
   "scheduler_mode": "round_robin",
   "allow_remote_migration": false,
@@ -1516,6 +1573,20 @@ curl -X DELETE "http://localhost:8080/api/admin/account-groups/1?force=true" \
 **响应:** 更新后的完整设置对象
 
 `codex_fingerprint_default_mode`（`off`/`device`/`session`/`full`，默认 `off`）是新导入或新建 Codex 账号默认盖上的设备指纹收敛档位，只影响之后新加入的账号；已有账号档位不变，入库后仍可在账号级单独调整。非法取值返回 HTTP 400。
+
+`max_retries`、`max_rate_limit_retries` 与 `codex_ws_silent_max_retries` 是原有的有限重试预算，管理界面和 API 范围均为 `0` 到 `10`（`0` 禁用对应预算）。需要持续重试时使用独立的 `continuous_retry_enabled` 开关；它不会改变这些有限预算的含义。开关打开后，可在 `continuous_retry_categories` 选择 `transport`、`http_429`、`http_4xx`、`http_5xx`、`stream_error`、`response_failed`、`context_error`，并用 `continuous_retry_status_codes`（例如 `[403,404,501]`）或 `continuous_retry_error_codes`（例如 `["rate_limited","context_length_exceeded"]`）精确追加匹配。类别、状态码、错误代码任一命中即可进入持续重试；403、404、上下文错误及“全部 `response.failed`”默认不选中（501 已由默认的 `http_5xx` 类别覆盖）。普通自选模式不会把结构化安全策略拒绝升级为无限重试。永久额度/余额错误（如 `insufficient_quota`、`quota_exceeded`、`billing_hard_limit`、`billing_limit_reached`、`spend_limit`、`credit_balance`、`insufficient_balance`、`usage_limited`）不会因为通用类别进入无限循环；只有管理员明确选择对应额度错误代码，或明确启用下述超级开关时，才会进入持续重试。
+
+`continuous_retry_catch_all` 是默认关闭的超级开关。请求同时提交 `continuous_retry_enabled=true` 与 `continuous_retry_catch_all=true` 后，除明确的上游 `cyber_policy` 外，所有被代理识别为真实上游失败的 HTTP 状态、传输/读取失败、`error` 帧、`response.failed` 以及以后出现的未知失败都会进入持续重试，不依赖当前已知错误码清单；永久额度、余额、鉴权、无效请求和其他结构化安全策略错误也包含在内。明确的上游 `cyber_policy` 始终终止当前请求，不换号、不重放。文本推理请求只把上游 HTTP `200` 及协议正常终态视为可提交结果；201、202、204、重定向、`response.failed`、独立 `error` 帧及无终态 EOF 都会丢弃整次尝试并继续重试。无状态请求会轮换可用账号；持有账号绑定加密状态的请求只有在能够安全展开为自包含请求时才换号，否则沿用相应协议的绑定语义。`continuous_retry_enabled=false` 会规范化为 `continuous_retry_catch_all=false`。
+
+开启持续重试后，流式上游尝试会先完整暂存，只有正常终态才一次性回放给客户端。因此失败尝试的半截文本、工具调用和错误帧不会泄漏，但客户端也不再实时逐 token 收到该次结果。SSE 路径在退避、等待账号、等待响应头和读取暂存流时写注释心跳并 flush；Responses WebSocket 使用 Ping。非流式 JSON（包括 Grok 图片/视频创建）在已进入无限重试后，会在退避、等待账号、等待响应头和读取响应体时发送标准 HTTP `102 Processing` 信息响应；它不会提交最终 JSON 的状态码或响应体，但中间代理可能丢弃 1xx，因此仍需依赖墙钟上限和客户端超时。`retry_interval_ms` 是本地等待下限；实际等待取该值、带抖动的指数退避（250ms 起步、30 秒封顶）和有效 `Retry-After`（最多 5 分钟）中的较大值。
+
+`continuous_retry_max_duration_seconds`（默认 600，范围 1-900）是无限预算的墙钟上限，从请求第一次进入 `retryLimit=-1` 时开始，后续尝试不会重置。到期会取消正在进行的上游请求，并返回最近一次真实上游失败；已提交的 SSE 将该失败转换为协议错误事件，Responses WebSocket 使用错误帧并以 1013 关闭。若尚无上游失败可返回，才回退到 504 `upstream_timeout`。Grok 图片/视频创建保持非流式 JSON；无限重试期间使用 HTTP `102 Processing` 保活，不把 SSE 注释混入最终 JSON。该信息响应是 best-effort 的，中间代理仍可能过滤它。
+
+每次流式尝试最多暂存 64 MiB：前 8 MiB 保存在内存，超过后写入立即 unlink 的 mode-0600 临时文件。达到单次上限或本地存储失败会立即结束请求，不会再次调用上游；当前没有跨请求的进程级暂存总预算，高并发部署仍需自行限制并发并监控内存和临时磁盘。Responses HTTP 的 `X-Codex-Turn-State` 只能在心跳尚未提交响应头时从最终成功账号转发；若等待期间已经发出 SSE 心跳，该响应头会被省略，不能用失败账号的值替代。账号绑定的 continuation 在无法安全展开为自包含请求时也会保留原账号语义。
+
+只有真实上游失败能够触发持续重试。客户端取消、持续重试期限到达、下游写入失败、入口校验、账号池/并发调度、本地提示词或输出策略拒绝、暂存资源失败以及成功结果回放失败都会立即结束，不会伪装成上游错误继续消耗账号。期限会保证等待中的 API Key 与 scope 并发槽位最终释放。
+
+普通图片请求仍受 5 次总尝试上限约束，普通 Grok 图片/视频创建请求仍受 3 次总尝试上限约束；错误被持续重试策略选中后（含超级模式）会越过普通上限，直到成功、客户端取消或期限到达。由于上游未必提供可靠幂等键，图片/视频创建可能重复生成和重复扣费。Grok 视频状态/内容查询沿用绑定账号与各自的请求语义。任何入口收到明确的上游 `cyber_policy` 都会立即停止，并保留本地审计、signed decision、conversation lock 与已验证用户冷却；超级模式不能覆盖此安全终态。初始账号池为空、模型无任何合格账号、scope/并发预算拒绝等本地调度失败不是“上游返回错误”，仍会返回明确的本地错误。
 
 Responses 上下文缓存字段使用原始字节数：
 

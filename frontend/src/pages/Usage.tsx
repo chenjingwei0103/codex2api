@@ -2725,12 +2725,12 @@ export default function Usage() {
                               </Badge>
                             )}
                             <Badge variant="outline" className={usageTableBadgeClass}>
-                              {(log.channel === 'codex' || log.channel === 'grok') && (
+                              {(log.channel === 'codex' || log.channel === 'grok' || log.channel === 'antigravity') && (
                                 <ChannelLogo
                                   channel={log.channel}
                                   size={13}
                                   className="mr-1"
-                                  title={log.channel === 'grok' ? 'Grok' : 'Codex'}
+                                  title={log.channel === 'grok' ? 'Grok' : log.channel === 'antigravity' ? 'Antigravity' : 'Codex'}
                                 />
                               )}
                               {log.model || '-'}

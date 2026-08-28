@@ -8,6 +8,9 @@ import {
   isUnsampledQuotaAccount,
   needsOfficialCostReload,
   needsUsageReload,
+  officialUsdFromDailyItems,
+  officialUsdValue,
+  supportsOfficialUsage,
 } from "./usageFormat.ts";
 
 test("usage reload accepts either optional usage window as sampled", () => {
@@ -61,10 +64,15 @@ test("unsampled quota accounts are not treated as available", () => {
 
 test("official cost reload only retries Codex accounts missing the snapshot", () => {
   assert.equal(needsOfficialCostReload({}), true);
+  assert.equal(needsOfficialCostReload({ official_usd: 0 }), false);
   assert.equal(needsOfficialCostReload({ official_usd_7d: 0 }), false);
   assert.equal(needsOfficialCostReload({ official_usd_7d: 12.5 }), false);
   assert.equal(needsOfficialCostReload({ openai_responses_api: true }), false);
   assert.equal(needsOfficialCostReload({ grok_api: true }), false);
+  assert.equal(
+    needsOfficialCostReload({ access_token_type: "codex_at" }),
+    false,
+  );
   assert.equal(needsOfficialCostReload({ status: "error" }), false);
   assert.equal(needsOfficialCostReload({ status: "unauthorized" }), false);
   assert.equal(
@@ -79,6 +87,11 @@ test("official cost reload only retries Codex accounts missing the snapshot", ()
     }),
     true,
   );
+  assert.equal(supportsOfficialUsage({}), true);
+  assert.equal(supportsOfficialUsage({ access_token_type: "codex_at" }), false);
+  assert.equal(supportsOfficialUsage({ access_token_type: " CODEX_AT " }), false);
+  assert.equal(supportsOfficialUsage({ openai_responses_api: true }), false);
+  assert.equal(supportsOfficialUsage({ grok_api: true }), false);
   assert.equal(isOfficialCostHiddenAccount({ status: "error" }), true);
   assert.equal(isOfficialCostHiddenAccount({ status: "active" }), false);
   assert.equal(
@@ -95,5 +108,35 @@ test("official cost reload stops once the backend reports a completed sync", () 
   assert.equal(
     needsOfficialCostReload({ official_usage_synced: false }),
     true,
+  );
+});
+
+test("official billed badge prefers official_usd over the 7d alias", () => {
+  assert.equal(officialUsdValue({}), null);
+  assert.equal(officialUsdValue({ official_usd_7d: 1.5 }), 1.5);
+  assert.equal(officialUsdValue({ official_usd: 9, official_usd_7d: 1.5 }), 9);
+});
+
+test("official billed badge sums all synced days unless a window is requested", () => {
+  assert.equal(officialUsdFromDailyItems([]), null);
+  assert.equal(
+    officialUsdFromDailyItems([
+      { day: "2026-08-20", usd: 10 },
+      { day: "2026-08-25", usd: 1.25 },
+      { day: "2026-08-26", usd: 2.5 },
+      { day: "2026-08-27", usd: 3 },
+    ]),
+    16.75,
+  );
+  assert.equal(
+    officialUsdFromDailyItems(
+      [
+        { day: "2026-08-20", usd: 10 },
+        { day: "2026-08-26", usd: 2 },
+        { day: "2026-08-27", usd: 3 },
+      ],
+      2,
+    ),
+    5,
   );
 });

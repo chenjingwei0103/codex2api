@@ -585,6 +585,32 @@ func TestAccountOperationSelectorNeverCrossesChannel(t *testing.T) {
 	}
 }
 
+func TestAccountOperationSelectorSupportsAntigravity(t *testing.T) {
+	handler, codexIDs, grokIDs := newPagedAccountsHandler(t)
+	ctx := context.Background()
+	antigravityID, err := handler.db.InsertAccountWithUpstream(ctx, "antigravity-1", "google", auth.UpstreamAntigravity, map[string]interface{}{
+		"upstream_type": auth.UpstreamAntigravity,
+		"refresh_token": "secret-antigravity-1",
+		"email":         "antigravity@example.org",
+	}, "")
+	if err != nil {
+		t.Fatalf("insert antigravity account: %v", err)
+	}
+
+	selected, err := handler.resolveAccountOperationSelector(ctx, &accountOperationSelector{Channel: database.UpstreamChannelAntigravity})
+	if err != nil {
+		t.Fatalf("resolve antigravity selector: %v", err)
+	}
+	if len(selected) != 1 || selected[0] != antigravityID {
+		t.Fatalf("antigravity selector ids = %v, want [%d]", selected, antigravityID)
+	}
+	for _, leakedID := range append(codexIDs, grokIDs...) {
+		if selected[0] == leakedID {
+			t.Fatalf("antigravity selector leaked account %d", leakedID)
+		}
+	}
+}
+
 func TestGetAccountReturnsOneEnrichedAccount(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	handler, codexIDs, _ := newPagedAccountsHandler(t)

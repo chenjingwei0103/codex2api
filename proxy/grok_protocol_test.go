@@ -20,7 +20,7 @@ func TestExecuteGrokProtocolRequestUsesCatalogBackend(t *testing.T) {
 	var gotBody []byte
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotPath = r.URL.Path
-		gotBody, _ = io.ReadAll(r.Body)
+		gotBody = readUpstreamRequestBody(r)
 		w.Header().Set("Content-Type", "text/event-stream")
 		_, _ = io.WriteString(w, "data: {\"id\":\"c1\",\"choices\":[{\"delta\":{\"content\":\"hi\"},\"finish_reason\":null}]}\n\n")
 		_, _ = io.WriteString(w, "data: {\"id\":\"c1\",\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":2,\"completion_tokens\":1,\"total_tokens\":3}}\n\n")
@@ -60,7 +60,7 @@ func TestExecuteGrokProtocolRequestBridgesResponsesToolsThroughChat(t *testing.T
 		if r.URL.Path != "/v1/chat/completions" {
 			t.Errorf("path = %q", r.URL.Path)
 		}
-		captured, _ = io.ReadAll(r.Body)
+		captured = readUpstreamRequestBody(r)
 		aliases := make(map[string]string)
 		for _, tool := range gjson.GetBytes(captured, "tools").Array() {
 			if tool.Get("type").String() != "function" || tool.Get("function.name").String() == "" {
@@ -224,7 +224,7 @@ func TestExecuteGrokProtocolRequestBridgesCustomToolThroughMessages(t *testing.T
 		if r.URL.Path != "/v1/messages" {
 			t.Errorf("path = %q", r.URL.Path)
 		}
-		captured, _ = io.ReadAll(r.Body)
+		captured = readUpstreamRequestBody(r)
 		alias := gjson.GetBytes(captured, "tools.0.name").String()
 		if alias == "" || gjson.GetBytes(captured, "tools.0.input_schema.required.0").String() != "input" {
 			t.Errorf("custom tool was not converted for Messages: %s", captured)
@@ -446,7 +446,7 @@ func TestExecuteGrokProtocolRequestNativePreservesInboundBody(t *testing.T) {
 		if r.URL.Path != "/v1/chat/completions" {
 			t.Fatalf("path = %q", r.URL.Path)
 		}
-		gotBody, _ = io.ReadAll(r.Body)
+		gotBody = readUpstreamRequestBody(r)
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = io.WriteString(w, `{"id":"chatcmpl-1","choices":[{"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}`)
 	}))
