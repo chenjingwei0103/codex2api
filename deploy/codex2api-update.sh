@@ -8,6 +8,7 @@ service_name="codex2api-uds.service"
 binary_path="/usr/local/bin/codex2api-uds"
 lock_path="/run/lock/codex2api-update.lock"
 log_path="/var/log/codex2api-update.log"
+deployed_revision_path="/var/lib/codex2api/deployed-revision"
 
 mkdir -p "$(dirname "$lock_path")"
 exec 9>"$lock_path"
@@ -42,9 +43,13 @@ fi
 remote_ref="$remote_name/$branch_name"
 local_revision="$(git rev-parse HEAD)"
 remote_revision="$(git rev-parse "$remote_ref")"
-if [[ "$local_revision" == "$remote_revision" ]]; then
+deployed_revision="$(cat "$deployed_revision_path" 2>/dev/null || true)"
+if [[ "$local_revision" == "$remote_revision" && "$deployed_revision" == "$remote_revision" ]]; then
   log "ok: already up to date at $local_revision"
   exit 0
+fi
+if [[ "$local_revision" == "$remote_revision" ]]; then
+  log "rebuild: source revision is not recorded as deployed"
 fi
 
 if ! git merge-base --is-ancestor HEAD "$remote_ref"; then
@@ -97,6 +102,10 @@ fi
 
 for attempt in $(seq 1 45); do
   if systemctl is-active --quiet "$service_name"; then
+    install -d -m 0755 "$(dirname "$deployed_revision_path")"
+    printf '%s\n' "$remote_revision" >"$deployed_revision_path.new"
+    install -m 0644 "$deployed_revision_path.new" "$deployed_revision_path"
+    rm -f "$deployed_revision_path.new"
     log "updated: $local_revision -> $remote_revision"
     exit 0
   fi
