@@ -99,6 +99,7 @@ type accountListSnapshotItem struct {
 	OccupiedRequests    int64
 	DynamicConcurrency  int64
 	OpenAIResponses     bool
+	Antigravity         bool
 	SearchText          string
 }
 
@@ -212,8 +213,8 @@ func (h *Handler) resolveAccountOperationSelector(ctx context.Context, selector 
 		return nil, fmt.Errorf("selector is required")
 	}
 	channel := strings.ToLower(strings.TrimSpace(selector.Channel))
-	if channel != database.UpstreamChannelCodex && channel != database.UpstreamChannelGrok {
-		return nil, fmt.Errorf("selector channel must be codex or grok")
+	if channel != database.UpstreamChannelCodex && channel != database.UpstreamChannelGrok && channel != database.UpstreamChannelAntigravity {
+		return nil, fmt.Errorf("selector channel must be codex, grok, or antigravity")
 	}
 	snapshot, err := h.getAccountListSnapshot(ctx, channel)
 	if err != nil {
@@ -678,6 +679,7 @@ func (h *Handler) installAccountListSnapshot(channel string, snapshot *accountLi
 func (h *Handler) buildAccountListSnapshotItem(row *database.AccountRow, requestCounts map[int64]*database.AccountRequestCount, todayUsage map[int64]*database.AccountTimeRangeUsage, groupNames, groupSort map[int64]string) *accountListSnapshotItem {
 	upstreamType := strings.TrimSpace(row.GetCredential("upstream_type"))
 	isGrok := strings.EqualFold(upstreamType, auth.UpstreamGrok)
+	isAntigravity := strings.EqualFold(upstreamType, auth.UpstreamAntigravity)
 	isOpenAIResponses := strings.EqualFold(upstreamType, auth.UpstreamOpenAIResponses)
 	email := row.GetCredential("email")
 	if isOpenAIResponses && email == "" {
@@ -696,11 +698,16 @@ func (h *Handler) buildAccountListSnapshotItem(row *database.AccountRow, request
 			grokAuthKind = auth.GrokAuthKindOAuth
 		}
 	}
+	status := row.Status
+	if isAntigravity {
+		status, _ = antigravityPersistedStatus(row)
+	}
 	item := &accountListSnapshotItem{
-		Row: row, ID: row.ID, Status: row.Status, CooldownReason: row.CooldownReason,
+		Row: row, ID: row.ID, Status: status, CooldownReason: row.CooldownReason,
 		Enabled: row.Enabled, Locked: row.Locked, PlanType: planType, GrokAuthKind: grokAuthKind,
 		Email: email, EmailDomain: accountEmailDomain(email), Tags: append([]string(nil), row.Tags...),
 		SchedulerPriority: valueOrZero(accountSchedulerPriority(row)), OpenAIResponses: isOpenAIResponses,
+		Antigravity: isAntigravity,
 	}
 	if row.CooldownUntil.Valid {
 		item.CooldownUntil = row.CooldownUntil.Time
@@ -713,40 +720,42 @@ func (h *Handler) buildAccountListSnapshotItem(row *database.AccountRow, request
 	if h.store != nil {
 		if runtimeAccount := h.store.FindByID(row.ID); runtimeAccount != nil {
 			runtimeSnapshot := runtimeAccount.GetAccountListRuntimeSnapshot()
-			item.Status = runtimeSnapshot.Status
-			item.UsingCredits = runtimeSnapshot.UsingCredits
 			item.GroupIDs = runtimeSnapshot.GroupIDs
-			if runtimePlan := runtimeSnapshot.PlanType; runtimePlan != "" {
-				item.PlanType = runtimePlan
-				if resolved, ok := auth.ResolveGrokPlan(runtimePlan); ok {
-					item.GrokPlanCategory = resolved.Key
+			if !isAntigravity {
+				item.Status = runtimeSnapshot.Status
+				item.UsingCredits = runtimeSnapshot.UsingCredits
+				if runtimePlan := runtimeSnapshot.PlanType; runtimePlan != "" {
+					item.PlanType = runtimePlan
+					if resolved, ok := auth.ResolveGrokPlan(runtimePlan); ok {
+						item.GrokPlanCategory = resolved.Key
+					}
 				}
-			}
-			if runtimeSnapshot.UsagePercent5hValid {
-				item.UsagePercent5h, item.UsagePercent5hOK = runtimeSnapshot.UsagePercent5h, true
-			}
-			if runtimeSnapshot.UsagePercent7dValid {
-				item.UsagePercent7d, item.UsagePercent7dOK = runtimeSnapshot.UsagePercent7d, true
-			}
-			if runtimeSnapshot.UsagePercentSparkValid {
-				item.UsagePercentSpark, item.UsagePercentSparkOK = runtimeSnapshot.UsagePercentSpark, true
-			}
-			item.HealthTier = runtimeSnapshot.HealthTier
-			item.DispatchScore = runtimeSnapshot.DispatchScore
-			item.LatencyPenalty = runtimeSnapshot.LatencyPenalty
-			item.LastUnauthorizedAt = runtimeSnapshot.LastUnauthorizedAt
-			item.LastRateLimitedAt = runtimeSnapshot.LastRateLimitedAt
-			item.LastTimeoutAt = runtimeSnapshot.LastTimeoutAt
-			item.ActiveRequests = runtimeSnapshot.ActiveRequests
-			item.OccupiedRequests = runtimeSnapshot.OccupiedRequests
-			item.DynamicConcurrency = runtimeSnapshot.DynamicConcurrencyLimit
-			item.Reset5hAt = runtimeSnapshot.Reset5hAt
-			item.Reset7dAt = runtimeSnapshot.Reset7dAt
-			item.ResetSparkAt = runtimeSnapshot.ResetSparkAt
-			item.Window7dSeconds = runtimeSnapshot.Window7dSeconds
-			if runtimeSnapshot.CooldownReason != "" {
-				item.CooldownReason = runtimeSnapshot.CooldownReason
-				item.CooldownUntil = runtimeSnapshot.CooldownUntil
+				if runtimeSnapshot.UsagePercent5hValid {
+					item.UsagePercent5h, item.UsagePercent5hOK = runtimeSnapshot.UsagePercent5h, true
+				}
+				if runtimeSnapshot.UsagePercent7dValid {
+					item.UsagePercent7d, item.UsagePercent7dOK = runtimeSnapshot.UsagePercent7d, true
+				}
+				if runtimeSnapshot.UsagePercentSparkValid {
+					item.UsagePercentSpark, item.UsagePercentSparkOK = runtimeSnapshot.UsagePercentSpark, true
+				}
+				item.HealthTier = runtimeSnapshot.HealthTier
+				item.DispatchScore = runtimeSnapshot.DispatchScore
+				item.LatencyPenalty = runtimeSnapshot.LatencyPenalty
+				item.LastUnauthorizedAt = runtimeSnapshot.LastUnauthorizedAt
+				item.LastRateLimitedAt = runtimeSnapshot.LastRateLimitedAt
+				item.LastTimeoutAt = runtimeSnapshot.LastTimeoutAt
+				item.ActiveRequests = runtimeSnapshot.ActiveRequests
+				item.OccupiedRequests = runtimeSnapshot.OccupiedRequests
+				item.DynamicConcurrency = runtimeSnapshot.DynamicConcurrencyLimit
+				item.Reset5hAt = runtimeSnapshot.Reset5hAt
+				item.Reset7dAt = runtimeSnapshot.Reset7dAt
+				item.ResetSparkAt = runtimeSnapshot.ResetSparkAt
+				item.Window7dSeconds = runtimeSnapshot.Window7dSeconds
+				if runtimeSnapshot.CooldownReason != "" {
+					item.CooldownReason = runtimeSnapshot.CooldownReason
+					item.CooldownUntil = runtimeSnapshot.CooldownUntil
+				}
 			}
 		}
 	}
@@ -775,6 +784,8 @@ func (h *Handler) buildAccountListSnapshotItem(row *database.AccountRow, request
 		searchParts = append(searchParts,
 			strings.Join(row.GetCredentialStringSlice("models"), " "), row.GetCredential("base_url"),
 			item.PlanType, item.GrokPlanCategory, row.ErrorMessage, row.ProxyURL, strings.Join(groupLabels, " "))
+	} else if isAntigravity {
+		searchParts = append(searchParts, item.PlanType, row.GetCredential("project_id"), row.GetCredential("antigravity_sync_error"), strings.Join(groupLabels, " "))
 	}
 	item.SearchText = strings.ToLower(strings.Join(searchParts, " "))
 	return item
@@ -1167,7 +1178,7 @@ func accountListOverloadPaused(item *accountListSnapshotItem) bool {
 }
 
 func accountListUnsampled(item *accountListSnapshotItem) bool {
-	if item == nil || item.OpenAIResponses || item.GrokAuthKind != "" {
+	if item == nil || item.OpenAIResponses || item.GrokAuthKind != "" || item.Antigravity {
 		return false
 	}
 	if item.Status == "unauthorized" || item.Status == "error" {

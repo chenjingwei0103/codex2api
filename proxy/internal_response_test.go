@@ -6,9 +6,61 @@ import (
 	"testing"
 
 	"github.com/codex2api/api"
+	"github.com/codex2api/auth"
 	"github.com/codex2api/database"
 	"github.com/gin-gonic/gin"
 )
+
+func TestApplyUpstreamChannelFilterAntigravityFailsClosed(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	c.Set(contextAPIKeyRow, &database.APIKeyRow{Limits: database.APIKeyLimits{UpstreamChannel: database.UpstreamChannelAntigravity}})
+	filter := (&Handler{}).applyUpstreamChannelFilter(c, "gpt-5.4", func(*auth.Account) bool { return true })
+
+	for _, account := range []*auth.Account{
+		{DBID: 1, AccessToken: "codex"},
+		{DBID: 2, UpstreamType: auth.UpstreamGrok, APIKey: "xai"},
+		{DBID: 3, UpstreamType: auth.UpstreamOpenAIResponses, APIKey: "relay", BaseURL: "https://relay.example/v1"},
+	} {
+		if filter(account) {
+			t.Fatalf("antigravity channel admitted runtime account %+v", account)
+		}
+	}
+}
+
+func TestResponsesFilterAdmitsAntigravityInLazyMode(t *testing.T) {
+	account := &auth.Account{
+		DBID: 4, UpstreamType: auth.UpstreamAntigravity, AccessToken: "google-token",
+		Models: []string{"gemini-3.7-flash-tiered"},
+	}
+	filter := accountFilterForResponsesModel("gemini-3.7-flash-medium", true)
+	if !filter(account) {
+		t.Fatal("responses filter rejected a configured Antigravity account")
+	}
+	if !relayAccountSupportsModel(account, "gemini-3.7-flash-medium") {
+		t.Fatal("relay model admission rejected Antigravity model")
+	}
+}
+
+func TestApplyCooldownForModelSkipsAntigravityUnauthorizedBan(t *testing.T) {
+	account := &auth.Account{
+		DBID:         5,
+		UpstreamType: auth.UpstreamAntigravity,
+		AccessToken:  "google-token",
+		RefreshToken: "google-refresh",
+		HealthTier:   auth.HealthTierHealthy,
+		Status:       auth.StatusReady,
+	}
+	store := auth.NewStore(nil, nil, nil)
+	handler := &Handler{store: store}
+	decision := handler.applyCooldownForModel(account, http.StatusUnauthorized, []byte(`{"error":"invalid_grant"}`), &http.Response{Header: make(http.Header)}, "gemini-2.5-flash")
+	if decision.Reason != "" {
+		t.Fatalf("applyCooldownForModel decision = %+v, want empty for Antigravity", decision)
+	}
+	if account.IsBanned() || account.HasActiveCooldown() {
+		t.Fatal("Codex unauthorized cooldown must not ban an Antigravity account")
+	}
+}
 
 func TestInternalResponseAttributionPreservesParentAuditIdentity(t *testing.T) {
 	gin.SetMode(gin.TestMode)
@@ -21,8 +73,8 @@ func TestInternalResponseAttributionPreservesParentAuditIdentity(t *testing.T) {
 		AllowedGroupIDs: []int64{9},
 		Limits: database.APIKeyLimits{
 			AutoCompactOnOverflow: true,
-			ModelAllow:             []string{"gpt-5.4"},
-			UpstreamChannel:        database.UpstreamChannelGrok,
+			ModelAllow:            []string{"gpt-5.4"},
+			UpstreamChannel:       database.UpstreamChannelGrok,
 		},
 	}
 	parent.Set(contextAPIKeyID, row.ID)

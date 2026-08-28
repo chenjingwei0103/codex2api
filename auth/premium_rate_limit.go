@@ -148,6 +148,24 @@ func (s *Store) PersistUsageSnapshot5hOnly(acc *Account) {
 	}
 }
 
+// Persist5hWindowActivated 把「已为哪个 Reset5hAt 发过开窗请求」写入 credentials，重启后不重复打。
+func (s *Store) Persist5hWindowActivated(acc *Account) {
+	if acc == nil || s == nil || s.db == nil {
+		return
+	}
+	resetAt := acc.GetActivated5hResetAt()
+	if resetAt.IsZero() {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := s.db.UpdateCredentials(ctx, acc.DBID, map[string]interface{}{
+		"codex_5h_window_activated_reset_at": resetAt.UTC().Format(time.RFC3339),
+	}); err != nil {
+		log.Printf("[账号 %d] 持久化 5h 开窗标记失败: %v", acc.DBID, err)
+	}
+}
+
 // ClearAbsentUsageSnapshot5h 在上游权威探测未返回 5h 窗口时清除本地 5h 快照。
 // 内存与 credentials 一并清掉（避免「内存无、库里有」重启后重新 hydrate）。
 // 若清理前处于 premium 5h 限流态，同步清除由此驱动的 cooldown。

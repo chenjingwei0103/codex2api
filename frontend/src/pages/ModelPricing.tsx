@@ -30,8 +30,18 @@ import { cn } from '@/lib/utils'
 import { useToast } from '../hooks/useToast'
 import { getErrorMessage } from '../utils/error'
 import type { ModelPricingOverride, OfficialPricingSyncConfig } from '@/types'
+import {
+  buildModelPricingPreview,
+  type PricingPreviewRate,
+} from '../lib/modelPricingPreview'
 
-type Row = { model: string; source: string; pricing: ModelPricingOverride }
+type Row = {
+  model: string
+  source: string
+  pricing: ModelPricingOverride
+  canonical_model?: string
+  is_alias?: boolean
+}
 type SourceFilter = 'all' | 'custom' | 'synced' | 'default' | 'unsaved'
 
 type FieldDef = {
@@ -75,6 +85,10 @@ function isDirty(draft: ModelPricingOverride | undefined, saved: ModelPricingOve
   for (const field of ALL_FIELDS) {
     if (normalizePrice(draft?.[field.key]) !== normalizePrice(saved?.[field.key])) return true
   }
+  if (
+    normalizePrice(draft?.long_context_threshold_tokens) !==
+    normalizePrice(saved?.long_context_threshold_tokens)
+  ) return true
   return false
 }
 
@@ -82,6 +96,10 @@ function isAdvancedDirty(draft: ModelPricingOverride | undefined, saved: ModelPr
   for (const field of ADVANCED_FIELDS) {
     if (normalizePrice(draft?.[field.key]) !== normalizePrice(saved?.[field.key])) return true
   }
+  if (
+    normalizePrice(draft?.long_context_threshold_tokens) !==
+    normalizePrice(saved?.long_context_threshold_tokens)
+  ) return true
   return false
 }
 
@@ -238,6 +256,161 @@ function PriceField({
       </div>
       <span className="text-[10px] font-medium text-muted-foreground/70">/ 1M tok</span>
     </label>
+  )
+}
+
+function ContextThresholdField({
+  value,
+  savedValue,
+  changed,
+  onChange,
+  onRevert,
+}: {
+  value: number
+  savedValue: number
+  changed: boolean
+  onChange: (next: string) => void
+  onRevert: () => void
+}) {
+  const { t } = useTranslation()
+  return (
+    <label
+      className={cn(
+        'group relative flex min-w-0 flex-col gap-1.5 rounded-xl border bg-background/80 p-2.5 transition-all sm:p-3',
+        changed
+          ? 'border-amber-500/40 bg-amber-500/5 ring-1 ring-amber-500/30'
+          : 'border-border/80 hover:bg-card',
+        'focus-within:border-primary/40 focus-within:ring-[3px] focus-within:ring-primary/15',
+      )}
+    >
+      <div className="flex items-center justify-between gap-1.5">
+        <span className="truncate text-[11px] font-semibold tracking-wide text-muted-foreground">
+          {t('settings.pricing.contextThreshold')}
+        </span>
+        {changed ? (
+          <button
+            type="button"
+            onClick={(event) => {
+              event.preventDefault()
+              onRevert()
+            }}
+            title={t('settings.pricing.revertThreshold', { value: savedValue })}
+            className="flex size-5 items-center justify-center rounded-md text-amber-600 transition-colors hover:bg-amber-500/20 dark:text-amber-400"
+          >
+            <Undo2 className="size-3" />
+          </button>
+        ) : null}
+      </div>
+      <input
+        type="number"
+        step={1}
+        min={0}
+        value={value}
+        onChange={(event) => onChange(event.target.value)}
+        className="h-7 w-full border-0 bg-transparent font-mono text-[15px] font-semibold tabular-nums text-foreground outline-none [appearance:textfield] [&::-webkit-inner-spin-button]:appearance-none [&::-webkit-outer-spin-button]:appearance-none"
+      />
+      <span className="text-[10px] font-medium text-muted-foreground/70">tokens</span>
+    </label>
+  )
+}
+
+function formatPreviewRate(rate: PricingPreviewRate) {
+  return `$${formatPriceDisplay(rate.input)} / $${formatPriceDisplay(rate.cached)} / $${formatPriceDisplay(rate.output)}`
+}
+
+function BillingRulePreview({ pricing }: { pricing: ModelPricingOverride }) {
+  const { t } = useTranslation()
+  const preview = buildModelPricingPreview(pricing)
+  const badge =
+    preview.mode === 'tiered'
+      ? t('settings.pricing.tiered')
+      : t('settings.pricing.singleTier')
+
+  return (
+    <section className='mt-4 rounded-xl border border-border/80 bg-muted/[0.18] p-3.5 sm:p-4'>
+      <div className='flex flex-wrap items-center justify-between gap-2'>
+        <div className='flex items-center gap-2'>
+          <span className='size-1.5 rounded-full bg-primary' aria-hidden />
+          <h5 className='text-[12px] font-semibold text-foreground'>
+            {t('settings.pricing.billingPreview')}
+          </h5>
+          <span className='rounded-full bg-background px-2 py-0.5 text-[10px] font-bold text-muted-foreground ring-1 ring-inset ring-border/70'>
+            {badge}
+          </span>
+        </div>
+        {preview.long ? (
+          <span className='text-[10px] font-medium text-muted-foreground'>
+            {t('settings.pricing.thresholdSummary', {
+              value: preview.threshold.toLocaleString(),
+            })}
+          </span>
+        ) : null}
+      </div>
+
+      <div className='mt-3 grid gap-2 sm:grid-cols-2 xl:grid-cols-4'>
+        <div className='rounded-lg border border-border/70 bg-background/70 px-3 py-2.5'>
+          <div className='text-[10px] font-semibold uppercase tracking-wide text-muted-foreground'>
+            {t('settings.pricing.standardRate')}
+          </div>
+          <div className='mt-1 font-mono text-xs font-semibold tabular-nums text-foreground'>
+            {formatPreviewRate(preview.standard)}
+          </div>
+          <div className='mt-0.5 text-[10px] text-muted-foreground'>
+            in / cached / out · USD/M
+          </div>
+        </div>
+        {preview.long ? (
+          <div className='rounded-lg border border-primary/20 bg-primary/[0.04] px-3 py-2.5'>
+            <div className='text-[10px] font-semibold uppercase tracking-wide text-primary'>
+              {t('settings.pricing.longRate')}
+            </div>
+            <div className='mt-1 font-mono text-xs font-semibold tabular-nums text-foreground'>
+              {formatPreviewRate(preview.long)}
+            </div>
+            <div className='mt-0.5 text-[10px] text-muted-foreground'>
+              {t('settings.pricing.fromTokens', {
+                value: preview.threshold.toLocaleString(),
+              })}
+            </div>
+          </div>
+        ) : null}
+        {preview.priority ? (
+          <div className='rounded-lg border border-amber-500/20 bg-amber-500/[0.04] px-3 py-2.5'>
+            <div className='text-[10px] font-semibold uppercase tracking-wide text-amber-700 dark:text-amber-300'>
+              {t('settings.pricing.priorityRate')}
+            </div>
+            <div className='mt-1 font-mono text-xs font-semibold tabular-nums text-foreground'>
+              {formatPreviewRate(preview.priority)}
+            </div>
+            <div className='mt-0.5 text-[10px] text-muted-foreground'>
+              {t('settings.pricing.priorityHint')}
+            </div>
+          </div>
+        ) : null}
+        {preview.flexMultiplier ? (
+          <div className='rounded-lg border border-sky-500/20 bg-sky-500/[0.04] px-3 py-2.5'>
+            <div className='text-[10px] font-semibold uppercase tracking-wide text-sky-700 dark:text-sky-300'>
+              {t('settings.pricing.flexRate')}
+            </div>
+            <div className='mt-1 font-mono text-xs font-semibold tabular-nums text-foreground'>
+              ×{preview.flexMultiplier}
+            </div>
+            <div className='mt-0.5 text-[10px] text-muted-foreground'>
+              {t('settings.pricing.flexHint')}
+            </div>
+          </div>
+        ) : null}
+      </div>
+
+      <div className='mt-3 rounded-lg border border-dashed border-border/80 bg-background/55 px-3 py-2.5'>
+        <div className='text-[10px] font-semibold uppercase tracking-wide text-muted-foreground'>
+          {t('settings.pricing.expressionPreview')}
+        </div>
+        <code className='mt-1 block break-all font-mono text-[10px] leading-relaxed text-muted-foreground'>
+          {preview.expression}
+        </code>
+      </div>
+    </section>
   )
 }
 
@@ -797,6 +970,11 @@ export default function ModelPricing() {
                 const inputVal = normalizePrice(draft.input)
                 const outputVal = normalizePrice(draft.output)
                 const multiplier = getOutputMultiplier(inputVal, outputVal)
+                const hasLongContextPricing =
+                  normalizePrice(draft.long_context_threshold_tokens) > 0 ||
+                  normalizePrice(draft.input_long) > 0 ||
+                  normalizePrice(draft.cached_input_long) > 0 ||
+                  normalizePrice(draft.output_long) > 0
 
                 return (
                   <article
@@ -816,6 +994,13 @@ export default function ModelPricing() {
                               <h4 className="truncate font-mono text-[15px] font-semibold tracking-tight text-foreground sm:text-base">
                                 {r.model}
                               </h4>
+                              {r.is_alias && r.canonical_model ? (
+                                <span className="inline-flex items-center gap-1 rounded-full bg-violet-500/10 px-2 py-0.5 text-[10px] font-bold text-violet-700 ring-1 ring-inset ring-violet-500/20 dark:text-violet-300">
+                                  {t('settings.pricing.aliasOf', {
+                                    model: r.canonical_model,
+                                  })}
+                                </span>
+                              ) : null}
                               <span
                                 className={cn(
                                   'inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-[10px] font-bold ring-1 ring-inset',
@@ -905,6 +1090,8 @@ export default function ModelPricing() {
                         ))}
                       </div>
 
+                      <BillingRulePreview pricing={draft} />
+
                       {/* Advanced rates */}
                       <div className="mt-3">
                         <button
@@ -960,6 +1147,22 @@ export default function ModelPricing() {
                                   onRevert={() => revertField(r.model, field.key)}
                                 />
                               ))}
+                              {hasLongContextPricing ? (
+                                <ContextThresholdField
+                                  value={Math.round(normalizePrice(draft.long_context_threshold_tokens))}
+                                  savedValue={Math.round(normalizePrice(r.pricing.long_context_threshold_tokens))}
+                                  changed={
+                                    normalizePrice(draft.long_context_threshold_tokens) !==
+                                    normalizePrice(r.pricing.long_context_threshold_tokens)
+                                  }
+                                  onChange={(next) =>
+                                    setField(r.model, 'long_context_threshold_tokens', next)
+                                  }
+                                  onRevert={() =>
+                                    revertField(r.model, 'long_context_threshold_tokens')
+                                  }
+                                />
+                              ) : null}
                             </div>
                           </div>
                         </div>

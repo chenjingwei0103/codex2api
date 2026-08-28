@@ -102,7 +102,7 @@ func TestWhamDailyUsageAutoRefreshEligibleSkipsErrorBannedAndNewAccounts(t *test
 	}
 }
 
-func TestWhamDailyUsageBackfillEligibleSkipsRelayAndGrok(t *testing.T) {
+func TestWhamDailyUsageBackfillEligibleSkipsRelayGrokAndCodexAT(t *testing.T) {
 	if !whamDailyUsageBackfillEligible(&auth.Account{DBID: 1, AccessToken: "at"}) {
 		t.Fatal("codex oauth account should be eligible")
 	}
@@ -115,6 +115,9 @@ func TestWhamDailyUsageBackfillEligibleSkipsRelayAndGrok(t *testing.T) {
 	}
 	if whamDailyUsageBackfillEligible(grok) {
 		t.Fatal("grok account should be skipped")
+	}
+	if whamDailyUsageBackfillEligible(&auth.Account{DBID: 4, AccessToken: "at-opaque"}) {
+		t.Fatal("codex_at account should be skipped")
 	}
 }
 

@@ -95,6 +95,10 @@ func (h *Handler) TestConnection(c *gin.Context) {
 		account = transient
 		isTransient = true
 	}
+	if account.IsAntigravityAPI() {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Antigravity 账号尚未接入推理测连，请使用配额刷新"})
+		return
+	}
 
 	// 连接测试虽是 SSE GET，却会写入未授权、错误、限流或恢复状态。等流结束后
 	// 再失效列表/分析快照，避免账号页继续把已判定的 401 账号显示为“未采样”。
@@ -1031,6 +1035,9 @@ func (h *Handler) emitBatchTestProgress(
 func (h *Handler) runSingleBatchTest(ctx context.Context, acc *auth.Account) (string, string) {
 	testCtx, cancel := context.WithTimeout(ctx, batchTestAccountTimeout)
 	defer cancel()
+	if acc == nil || acc.IsAntigravityAPI() {
+		return "failed", "Antigravity 账号尚未接入推理测连"
+	}
 
 	if !acc.IsRelayStyle() && !acc.IsCodexAgentIdentity() && acc.GetAccessToken() == "" {
 		acc.Mu().RLock()
@@ -1149,6 +1156,9 @@ func (h *Handler) runSingleBatchTest(ctx context.Context, acc *auth.Account) (st
 func (h *Handler) runRecycleBinSingleTest(ctx context.Context, acc *auth.Account) (string, string) {
 	testCtx, cancel := context.WithTimeout(ctx, batchTestAccountTimeout)
 	defer cancel()
+	if acc == nil || acc.IsAntigravityAPI() {
+		return "failed", "Antigravity 账号尚未接入推理测连"
+	}
 
 	if !acc.IsRelayStyle() && !acc.IsCodexAgentIdentity() && acc.GetAccessToken() == "" {
 		return "failed", "账号缺少可用的 Access Token"

@@ -11,8 +11,22 @@ import type {
   AgentIdentityBatchImportResponse,
   AgentIdentityImportItem,
   AddOpenAIResponsesAccountRequest,
+  OpenAIResponsesBalanceResponse,
   AddGrokAccountRequest,
   UpdateGrokAccountRequest,
+  AddAntigravityAccountRequest,
+  AntigravityCreateResponse,
+  UpdateAntigravityAccountRequest,
+  AntigravityImportRequest,
+  AntigravityImportResponse,
+  AntigravityOAuthStartRequest,
+  AntigravityOAuthStartResponse,
+  AntigravityOAuthStatusResponse,
+  AntigravityOAuthCompleteRequest,
+  AntigravityOAuthCompleteResponse,
+  AntigravityAccountState,
+  AntigravityStateSyncResponse,
+  AntigravityCapabilityProbeResponse,
   BatchUpdateGrokModelsRequest,
   BatchUpdateGrokModelsResponse,
   FetchGrokModelsResponse,
@@ -110,6 +124,7 @@ import type {
   BackgroundUploadResponse,
   CreateAccountGroupRequest,
   UpdateAccountGroupRequest,
+  UpstreamChannel,
 } from './types'
 
 const BASE = '/api/admin'
@@ -214,7 +229,11 @@ async function request<T>(path: string, options: RequestOptions = {}): Promise<T
     throw new AdminAPIError(res.status, extractAdminErrorMessage(body, res.status))
   }
 
-  return (await res.json()) as T
+  if (res.status === 204) {
+    return undefined as T
+  }
+  const text = await res.text()
+  return (text ? JSON.parse(text) : undefined) as T
 }
 
 async function requestPublic<T>(path: string, options: RequestInit = {}): Promise<T> {
@@ -333,8 +352,8 @@ async function requestImageStudioPortalBlob(path: string, apiKey: string, option
   return res.blob()
 }
 
-/** 下载物：blob + 服务端在 Content-Disposition 里给出的文件名（可能为空）。 */
-export type NamedBlob = { blob: Blob; filename: string }
+/** 下载物：blob + 服务端给出的文件名与实际导出数量（响应头可能缺省）。 */
+export type NamedBlob = { blob: Blob; filename: string; count?: number }
 
 /** parseContentDispositionFilename 取 Content-Disposition 里的 filename，取不到返回空串。 */
 function parseContentDispositionFilename(header: string | null): string {
@@ -350,6 +369,12 @@ function parseContentDispositionFilename(header: string | null): string {
   }
   const plain = /filename="?([^";]+)"?/i.exec(header)
   return plain?.[1]?.trim() ?? ''
+}
+
+function parseOptionalCountHeader(header: string | null): number | undefined {
+  if (!header || !/^\d+$/.test(header.trim())) return undefined
+  const count = Number(header.trim())
+  return Number.isSafeInteger(count) && count >= 0 ? count : undefined
 }
 
 async function requestNamedBlob(path: string, options: RequestInit = {}): Promise<NamedBlob> {
@@ -377,6 +402,7 @@ async function requestNamedBlob(path: string, options: RequestInit = {}): Promis
   return {
     blob: await res.blob(),
     filename: parseContentDispositionFilename(res.headers.get('Content-Disposition')),
+    count: parseOptionalCountHeader(res.headers.get('X-Export-Count')),
   }
 }
 
@@ -534,9 +560,9 @@ export const api = {
   deletePortalImageAsset: (apiKey: string, id: number) =>
     requestImageStudioPortal<MessageResponse>(`/assets/${id}`, apiKey, { method: 'DELETE' }),
   getStats: () => request<StatsResponse>('/stats'),
-  // channel: 'codex' | 'grok' — server-side filter; omit for all accounts.
+  // channel is a first-class upstream provider filter; omit for all accounts.
   // view: 'lite' — 只返回身份/绑定字段,跳过用量富化(代理绑定弹窗等场景)。
-  getAccounts: (params: { channel?: 'codex' | 'grok'; view?: 'lite' } = {}) => {
+  getAccounts: (params: { channel?: UpstreamChannel; view?: 'lite' } = {}) => {
     const searchParams = new URLSearchParams()
     if (params.channel) searchParams.set('channel', params.channel)
     if (params.view) searchParams.set('view', params.view)
@@ -566,7 +592,7 @@ export const api = {
     if (params.order) searchParams.set('order', params.order)
     return request<AccountsPageResponse>(`/accounts?${searchParams.toString()}`, { signal })
   },
-  getAccountAnalysis: (channel: 'codex' | 'grok' = 'codex', signal?: AbortSignal) =>
+  getAccountAnalysis: (channel: 'codex' | 'grok' | 'antigravity' = 'codex', signal?: AbortSignal) =>
     request<AccountAnalysisResponse>(`/accounts/analysis?channel=${channel}`, { signal }),
   getAccountPageStats: (ids: number[], signal?: AbortSignal) => {
     const query = new URLSearchParams({ ids: ids.join(',') })
@@ -590,6 +616,11 @@ export const api = {
     request<FetchOpenAIResponsesModelsResponse>('/accounts/openai-responses/models', { method: 'POST', body: JSON.stringify(data) }),
   updateOpenAIResponsesAccount: (id: number, data: UpdateOpenAIResponsesAccountRequest) =>
     request<MessageResponse>(`/accounts/${id}/openai-responses`, { method: 'PATCH', body: JSON.stringify(data) }),
+  getOpenAIResponsesBalance: (id: number, signal?: AbortSignal, force = false) =>
+    request<OpenAIResponsesBalanceResponse>(
+      `/accounts/${id}/openai-responses/balance${force ? '?refresh=1' : ''}`,
+      { signal, timeoutMs: 25_000 },
+    ),
   addGrokAccount: (data: AddGrokAccountRequest) =>
     request<CreateAccountResponse>('/accounts/grok', { method: 'POST', body: JSON.stringify(data) }),
   fetchGrokModels: (data: AddGrokAccountRequest) =>
@@ -621,6 +652,77 @@ export const api = {
     }),
   updateGrokAccount: (id: number, data: UpdateGrokAccountRequest) =>
     request<MessageResponse>(`/accounts/${id}/grok`, { method: 'PATCH', body: JSON.stringify(data) }),
+  fetchAntigravityModels: (data: AddAntigravityAccountRequest) =>
+    request<{ models: string[] }>('/accounts/antigravity/models', {
+      method: 'POST',
+      body: JSON.stringify(data),
+    }),
+  batchUpdateAntigravityModels: (data: { ids: number[]; models: string[] }) =>
+    request<{ success: number; failed: number; models: string[] }>('/accounts/antigravity/batch-models', {
+      method: 'POST',
+      body: JSON.stringify(data),
+    }),
+  addAntigravityAccount: (data: AddAntigravityAccountRequest) =>
+    request<AntigravityCreateResponse>('/accounts/antigravity', {
+      method: 'POST',
+      body: JSON.stringify(data),
+      timeoutMs: 120_000,
+    }),
+  importAntigravityAccounts: (data: AntigravityImportRequest) =>
+    request<AntigravityImportResponse>('/accounts/antigravity/import', {
+      method: 'POST',
+      body: JSON.stringify(data),
+      timeoutMs: 180_000,
+    }),
+  updateAntigravityAccount: (id: number, data: UpdateAntigravityAccountRequest) =>
+    request<MessageResponse>(`/accounts/${id}/antigravity`, {
+      method: 'PATCH',
+      body: JSON.stringify(data),
+      timeoutMs: 120_000,
+    }),
+  refreshAntigravityAccount: (id: number) =>
+    request<MessageResponse>(`/accounts/${id}/antigravity/refresh`, {
+      method: 'POST',
+      timeoutMs: 120_000,
+    }),
+  refreshAntigravityQuota: (id: number) =>
+    request<MessageResponse>(`/accounts/${id}/antigravity/quota`, {
+      method: 'POST',
+      timeoutMs: 120_000,
+    }),
+  getAntigravityAccountState: (id: number, signal?: AbortSignal) =>
+    request<AntigravityAccountState>(`/accounts/${id}/antigravity/state`, { signal }),
+  syncAntigravityAccountState: (id: number) =>
+    request<AntigravityStateSyncResponse>(`/accounts/${id}/antigravity/sync`, {
+      method: 'POST',
+      timeoutMs: 120_000,
+    }),
+  probeAntigravityAccountCapabilities: (id: number) =>
+    request<AntigravityCapabilityProbeResponse>(`/accounts/${id}/antigravity/capabilities/probe`, {
+      method: 'POST',
+      timeoutMs: 45_000,
+    }),
+  startAntigravityOAuth: (data: AntigravityOAuthStartRequest = {}) =>
+    request<AntigravityOAuthStartResponse>('/accounts/antigravity/oauth/start', {
+      method: 'POST',
+      body: JSON.stringify(data),
+      timeoutMs: 20_000,
+    }),
+  getAntigravityOAuthStatus: (sessionId: string, signal?: AbortSignal) =>
+    request<AntigravityOAuthStatusResponse>(
+      `/accounts/antigravity/oauth/status?session_id=${encodeURIComponent(sessionId)}`,
+      { signal, timeoutMs: 10_000 },
+    ),
+  completeAntigravityOAuth: (data: AntigravityOAuthCompleteRequest) =>
+    request<AntigravityOAuthCompleteResponse>('/accounts/antigravity/oauth/complete', {
+      method: 'POST',
+      body: JSON.stringify(data),
+      timeoutMs: 15_000,
+    }),
+  cancelAntigravityOAuth: (sessionId: string) =>
+    request<void>(`/accounts/antigravity/oauth/${encodeURIComponent(sessionId)}`, {
+      method: 'DELETE',
+    }),
   batchUpdateGrokModels: (data: BatchUpdateGrokModelsRequest) =>
     request<BatchUpdateGrokModelsResponse>('/accounts/grok/batch-models', {
       method: 'POST',
@@ -1059,9 +1161,10 @@ export const api = {
     }
     return request<PromptFilterLogsResponse>(`/prompt-filter/logs?${search.toString()}`)
   },
-  clearPromptFilterLogs: (params: { reviewed?: boolean } = {}) => {
+  clearPromptFilterLogs: (params: { reviewed?: boolean; source?: 'local_filter' } = {}) => {
     const search = new URLSearchParams()
     if (typeof params.reviewed === 'boolean') search.set('reviewed', String(params.reviewed))
+    if (params.source) search.set('source', params.source)
     const suffix = search.size > 0 ? `?${search.toString()}` : ''
     return request<MessageResponse>(`/prompt-filter/logs${suffix}`, { method: 'DELETE' })
   },
@@ -1094,7 +1197,9 @@ export const api = {
 		request<PromptPolicyAuditHealth>('/prompt-policy/incidents/health'),
 	clearPromptPolicyIncidents: () =>
 		request<MessageResponse>('/prompt-policy/incidents', { method: 'DELETE' }),
-	getPromptRiskProfiles: (params: { page?: number; pageSize?: number; subjectType?: string; platform?: string; riskLevel?: string; apiKeyId?: string; accountId?: string; minScore?: string; q?: string; lockedOnly?: boolean } = {}) => {
+	deletePromptPolicyIncident: (incidentId: string) =>
+		request<MessageResponse>(`/prompt-policy/incidents/${encodeURIComponent(incidentId)}`, { method: 'DELETE' }),
+	getPromptRiskProfiles: (params: { page?: number; pageSize?: number; subjectType?: string; platform?: string; riskLevel?: string; apiKeyId?: string; accountId?: string; minScore?: string; q?: string; lockedOnly?: boolean; cyOnly?: boolean; activityState?: string } = {}) => {
 		const search = new URLSearchParams()
 		search.set('page', String(params.page || 1))
 		search.set('page_size', String(params.pageSize || 20))
@@ -1106,6 +1211,8 @@ export const api = {
 		if (params.minScore) search.set('min_score', params.minScore)
 		if (params.q) search.set('q', params.q)
 		if (params.lockedOnly) search.set('locked_only', 'true')
+		if (params.cyOnly) search.set('cy_only', 'true')
+		if (params.activityState) search.set('activity_state', params.activityState)
 		return request<import('./types').PromptRiskProfilesResponse>(`/prompt-policy/risk-profiles?${search.toString()}`)
 	},
 	getPromptRiskProfile: (subjectType: string, subjectKey: string, eventPage = 1, eventPageSize = 20, trustEventPage = 1, trustEventPageSize = 20) =>
@@ -1187,7 +1294,13 @@ export const api = {
     }>('/codex-cli-version/sync', { method: 'POST' }),
   listModelPricing: () =>
     request<{
-      models: Array<{ model: string; source: string; pricing: ModelPricingOverride }>
+      models: Array<{
+        model: string
+        source: string
+        pricing: ModelPricingOverride
+        canonical_model?: string
+        is_alias?: boolean
+      }>
       sync_url: string
       default_sync_url: string
       models_dev_url: string
@@ -1233,6 +1346,10 @@ export const api = {
     request<{ message: string; cleaned: number }>('/accounts/grok/clean-banned', { method: 'POST' }),
   cleanGrokError: () =>
     request<{ message: string; cleaned: number }>('/accounts/grok/clean-error', { method: 'POST' }),
+  cleanAntigravityBanned: () =>
+    request<{ message: string; cleaned: number }>('/accounts/antigravity/clean-banned', { method: 'POST' }),
+  cleanAntigravityError: () =>
+    request<{ message: string; cleaned: number }>('/accounts/antigravity/clean-error', { method: 'POST' }),
   exportAccounts: (params: { filter: 'healthy' | 'all'; ids?: number[]; channel?: 'codex' | 'grok' }) => {
     const sp = new URLSearchParams({ filter: params.filter })
     if (params.ids && params.ids.length > 0) sp.set('ids', params.ids.join(','))
@@ -1257,6 +1374,13 @@ export const api = {
     const sp = new URLSearchParams({ filter: 'all' })
     if (ids && ids.length > 0) sp.set('ids', ids.join(','))
     return requestNamedBlob(`/accounts/grok/export?${sp.toString()}`)
+  },
+  /** Admin-only secret-bearing Antigravity credential download (JSON or ZIP). */
+  exportAntigravityAccounts: (ids?: number[]) => {
+    const sp = new URLSearchParams()
+    if (ids && ids.length > 0) sp.set('ids', ids.join(','))
+    const query = sp.toString()
+    return requestNamedBlob(`/accounts/antigravity/export${query ? `?${query}` : ''}`)
   },
   migrateAccounts: (data: { url: string; admin_key: string }) =>
     request<{ message: string; total: number; imported: number; duplicate: number; failed: number }>(
