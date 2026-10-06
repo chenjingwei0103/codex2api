@@ -53,14 +53,10 @@ func (h *Handler) StartGrokStatusProbe(ctx context.Context) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	// One startup seed repairs rows created by older versions. New/changed Grok
-	// accounts are enqueued by database triggers thereafter.
-	h.startDBBackgroundTaskWithParent(ctx, func(ctx context.Context) {
-		if err := h.db.SeedGrokMaintenanceJobs(ctx, time.Now()); err != nil {
-			log.Printf("[grok-maintenance] 初始化到期任务失败: %v", err)
-		}
-		h.runGrokMaintenanceQueue(ctx, database.MaintenanceJobGrokFreshness, grokMaintenanceBatchSize)
-	})
+	// Periodic control-plane/catalog refresh is intentionally disabled. Inference
+	// still records exhausted billing and settings responses; allow_access and
+	// billing gates fail open after their stored facts expire.
+	log.Printf("[grok-maintenance] kind=%s periodic refresh disabled", database.MaintenanceJobGrokFreshness)
 	h.startDBBackgroundTaskWithParent(ctx, func(ctx context.Context) {
 		h.runGrokMaintenanceQueue(ctx, database.MaintenanceJobGrokCapability, 4)
 	})
