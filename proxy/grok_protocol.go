@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"strconv"
 	"strings"
@@ -2039,6 +2040,13 @@ func ExecuteGrokProtocolRequest(ctx context.Context, account *auth.Account, inbo
 	preflight, err := prepareRoutedGrokProtocolRequestWithCompaction(route, inbound, inboundBody, responsesBody, preservedCompaction)
 	if err != nil {
 		return nil, ErrBadRequest("Grok protocol conversion failed: " + err.Error())
+	}
+	if route.Protocol == GrokProtocolResponses {
+		if updated, repeated := appendGrokContinueForRepeatedToolCall(preflight.Body); repeated {
+			preflight.Body = updated
+			preflight.TurnIndex = grokTurnIndex(preflight.Body)
+			log.Printf("Grok 重复工具调用，上游请求追加 continue")
+		}
 	}
 	baseURL, bearer := account.GrokCredentials()
 	_ = baseURL

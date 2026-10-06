@@ -330,6 +330,11 @@ func ExecuteGrokRequest(ctx context.Context, account *auth.Account, requestBody 
 	}
 	preflight := prepareGrokUpstreamBodyWithCompaction(requestBody, nil, account.GrokReasoningMenu(gjson.GetBytes(requestBody, "model").String()))
 	requestBody = preflight.Body
+	if updated, repeated := appendGrokContinueForRepeatedToolCall(requestBody); repeated {
+		requestBody = updated
+		preflight.TurnIndex = grokTurnIndex(requestBody)
+		log.Printf("Grok 重复工具调用，上游请求追加 continue")
+	}
 	nsAliases := preflight.Aliases
 	logGrokPrefixFingerprint(requestBody, preflight.TurnIndex, preflight.Model)
 
