@@ -22,7 +22,10 @@ const (
 	grokMaintenancePollInterval = time.Second
 	grokMaintenanceLease        = 20 * time.Minute
 	// Control-plane work has its own capacity; generation probes use another queue.
-	grokMaintenanceBatchSize = 64
+	grokMaintenanceBatchSize      = 64
+	grokTokenRefreshConcurrency   = 10
+	grokTokenRefreshCheckInterval = time.Minute
+	grokTokenRefreshWindow        = 5 * time.Minute
 )
 
 var errGrokMaintenanceProjectionIncomplete = errors.New("grok maintenance projection remains incomplete")
@@ -57,6 +60,12 @@ func (h *Handler) StartGrokStatusProbe(ctx context.Context) {
 	// still records exhausted billing and settings responses; allow_access and
 	// billing gates fail open after their stored facts expire.
 	log.Printf("[grok-maintenance] kind=%s periodic refresh disabled", database.MaintenanceJobGrokFreshness)
+	// OAuth token rotation remains enabled independently, so suppressing the
+	// control-plane scan cannot leave access tokens expired until a request
+	// happens to target the account.
+	h.startDBBackgroundTaskWithParent(ctx, func(ctx context.Context) {
+		h.runGrokTokenRefreshLoop(ctx)
+	})
 	h.startDBBackgroundTaskWithParent(ctx, func(ctx context.Context) {
 		h.runGrokMaintenanceQueue(ctx, database.MaintenanceJobGrokCapability, 4)
 	})
@@ -85,6 +94,67 @@ func (h *Handler) StartGrokStatusProbe(ctx context.Context) {
 			h.runGrokStatusProbe(ctx)
 		}
 	})
+}
+
+func (h *Handler) runGrokTokenRefreshLoop(ctx context.Context) {
+	if h == nil || h.store == nil {
+		return
+	}
+	refresh := func() {
+		candidates := make([]*auth.Account, 0)
+		for _, account := range h.store.EnabledGrokAccounts() {
+			if account.GrokAuthKind() == auth.GrokAuthKindOAuth && grokAccessTokenExpiresWithin(account, grokTokenRefreshWindow) {
+				candidates = append(candidates, account)
+			}
+		}
+		if len(candidates) == 0 {
+			return
+		}
+		jobs := make(chan *auth.Account)
+		var wg sync.WaitGroup
+		var refreshed, failed atomic.Int64
+		workers := min(grokTokenRefreshConcurrency, len(candidates))
+		for range workers {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				for account := range jobs {
+					refreshCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+					err := h.store.RefreshGrokAccountByID(refreshCtx, account.DBID)
+					cancel()
+					if err != nil {
+						failed.Add(1)
+						continue
+					}
+					refreshed.Add(1)
+				}
+			}()
+		}
+		for _, account := range candidates {
+			select {
+			case jobs <- account:
+			case <-ctx.Done():
+				close(jobs)
+				wg.Wait()
+				return
+			}
+		}
+		close(jobs)
+		wg.Wait()
+		log.Printf("[grok-token-refresh] candidates=%d refreshed=%d failed=%d", len(candidates), refreshed.Load(), failed.Load())
+	}
+
+	refresh()
+	ticker := time.NewTicker(grokTokenRefreshCheckInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			refresh()
+		}
+	}
 }
 
 func (h *Handler) runDueGrokMaintenanceJobs(ctx context.Context, owner string) {
