@@ -23,7 +23,7 @@ import (
 )
 
 const (
-	grokFactFreshness        = 5 * time.Minute
+	grokFactFreshness        = 60 * time.Minute
 	grokUserUpgradeFreshness = 60 * time.Second
 	grokBillingHotFreshness  = 30 * time.Second
 	grokCapabilityOKTTL      = 24 * time.Hour
