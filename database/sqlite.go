@@ -1245,10 +1245,6 @@ func (db *DB) getUsageStatsSQLite(ctx context.Context, rangeStart, rangeEnd time
 		stats.AvgUserBilled = stats.TotalUserBilled / float64(stats.TotalRequests)
 	}
 	if includeBreakdowns {
-		stats.ModelStats, err = db.getUsageModelStats(ctx, 10, rangeStart, rangeEnd, channel, dim)
-		if err != nil {
-			return nil, err
-		}
 		if err := db.populateUsageBreakdownStats(ctx, stats, rangeStart, rangeEnd, channel, dim); err != nil {
 			return nil, err
 		}

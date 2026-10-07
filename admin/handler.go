@@ -8508,7 +8508,9 @@ func (h *Handler) ClearUsageLogs(c *gin.Context) {
 
 // ==================== API Keys ====================
 
-// ListAPIKeys 获取所有 API 密钥（脱敏版本）
+// ListAPIKeys 获取所有 API 密钥（脱敏版本）。
+// view=lite 只返回密钥行本身,跳过窗口费用与最近使用时间:这两项要聚合 usage_logs,
+// 而筛选下拉、横幅等场景用不到,慢盘 SQLite 上每次打开页面都白扫一遍。
 func (h *Handler) ListAPIKeys(c *gin.Context) {
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
 	defer cancel()
@@ -8516,6 +8518,14 @@ func (h *Handler) ListAPIKeys(c *gin.Context) {
 	keys, err := h.db.ListAPIKeys(ctx)
 	if err != nil {
 		writeInternalError(c, err)
+		return
+	}
+	if strings.EqualFold(strings.TrimSpace(c.Query("view")), "lite") {
+		maskedKeys := make([]*MaskedAPIKeyRow, 0, len(keys))
+		for _, k := range keys {
+			maskedKeys = append(maskedKeys, NewMaskedAPIKeyRow(k))
+		}
+		c.JSON(http.StatusOK, apiKeysResponse{Keys: maskedKeys})
 		return
 	}
 

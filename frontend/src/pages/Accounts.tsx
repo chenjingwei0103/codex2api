@@ -2819,7 +2819,7 @@ export default function Accounts() {
   useEffect(() => {
     if (providerView !== "codex") return;
     let cancelled = false;
-    void api.getAPIKeys()
+    void api.getAPIKeys({ view: 'lite' })
       .then((response) => { if (!cancelled) setAPIKeys(response.keys ?? []); })
       .catch(() => undefined);
     void api.listAccountGroups()

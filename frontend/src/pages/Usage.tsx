@@ -1745,7 +1745,7 @@ export default function Usage() {
 
   const loadAPIKeys = useCallback(async () => {
     try {
-      const response = await api.getAPIKeys()
+      const response = await api.getAPIKeys({ view: 'lite' })
       setAPIKeys(response.keys ?? [])
       setAPIKeyLoadFailed(false)
     } catch {

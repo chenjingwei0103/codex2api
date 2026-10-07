@@ -221,12 +221,12 @@ type DB struct {
 	logWg   sync.WaitGroup
 
 	// 缓冲溢出/脏数据丢弃的累计条数，暴露在运行状态里供运维观察
-	usageLogDropped   int64
+	usageLogDropped   atomic.Int64
 	usageLogDropLogAt time.Time // 溢出日志的限流时间戳，由 logMu 保护
 
 	usageLogMode          atomic.Value // string: full|errors|off
-	usageLogBatchSize     int64
-	usageLogFlushInterval int64 // ns
+	usageLogBatchSize     atomic.Int64
+	usageLogFlushInterval atomic.Int64 // ns
 	logFlushNotify        chan struct{}
 	accountInsertMu       sync.Mutex
 	sqliteWriteSem        chan struct{}
@@ -988,8 +988,8 @@ func (db *DB) SetUsageLogConfig(mode string, batchSize int, flushIntervalSeconds
 	batchSize = NormalizeUsageLogBatchSize(batchSize)
 	flushIntervalSeconds = NormalizeUsageLogFlushIntervalSeconds(flushIntervalSeconds)
 	db.usageLogMode.Store(mode)
-	atomic.StoreInt64(&db.usageLogBatchSize, int64(batchSize))
-	atomic.StoreInt64(&db.usageLogFlushInterval, int64(time.Duration(flushIntervalSeconds)*time.Second))
+	db.usageLogBatchSize.Store(int64(batchSize))
+	db.usageLogFlushInterval.Store(int64(time.Duration(flushIntervalSeconds) * time.Second))
 }
 
 func (db *DB) GetUsageLogMode() string {
@@ -1006,7 +1006,7 @@ func (db *DB) GetUsageLogBatchSize() int {
 	if db == nil {
 		return defaultUsageLogBatchSize
 	}
-	n := int(atomic.LoadInt64(&db.usageLogBatchSize))
+	n := int(db.usageLogBatchSize.Load())
 	return NormalizeUsageLogBatchSize(n)
 }
 
@@ -1014,7 +1014,7 @@ func (db *DB) GetUsageLogFlushIntervalSeconds() int {
 	if db == nil {
 		return defaultUsageLogFlushIntervalSeconds
 	}
-	d := time.Duration(atomic.LoadInt64(&db.usageLogFlushInterval))
+	d := time.Duration(db.usageLogFlushInterval.Load())
 	if d <= 0 {
 		return defaultUsageLogFlushIntervalSeconds
 	}
@@ -1056,7 +1056,7 @@ func (db *DB) GetUsageLogRuntimeStats() UsageLogRuntimeStats {
 	stats.BufferCapacity = cap(db.logBuf)
 	db.logMu.Unlock()
 	stats.BufferLimit = usageLogBufferHardLimit
-	stats.DroppedTotal = atomic.LoadInt64(&db.usageLogDropped)
+	stats.DroppedTotal = db.usageLogDropped.Load()
 
 	return stats
 }
@@ -1065,7 +1065,7 @@ func (db *DB) getUsageLogFlushInterval() time.Duration {
 	if db == nil {
 		return time.Duration(defaultUsageLogFlushIntervalSeconds) * time.Second
 	}
-	d := time.Duration(atomic.LoadInt64(&db.usageLogFlushInterval))
+	d := time.Duration(db.usageLogFlushInterval.Load())
 	if d <= 0 {
 		return time.Duration(defaultUsageLogFlushIntervalSeconds) * time.Second
 	}
@@ -4396,7 +4396,7 @@ func (db *DB) trimUsageLogBufferLocked() {
 		return
 	}
 	db.logBuf = append(db.logBuf[:0], db.logBuf[overflow:]...)
-	total := atomic.AddInt64(&db.usageLogDropped, int64(overflow))
+	total := db.usageLogDropped.Add(int64(overflow))
 	if now := time.Now(); now.Sub(db.usageLogDropLogAt) >= 30*time.Second {
 		db.usageLogDropLogAt = now
 		log.Printf("用量日志缓冲已达上限 %d 条，丢弃最旧的 %d 条（累计丢弃 %d 条），请检查数据库是否可写",
@@ -4752,7 +4752,7 @@ func (db *DB) flushLogBatch(drain bool) bool {
 		// 脏数据重试多少次都写不进去，隔离出来丢掉，其余照常落库。
 		pending, dropped := db.salvageUsageLogBatch(ctx, batch, err)
 		if dropped > 0 {
-			total := atomic.AddInt64(&db.usageLogDropped, int64(dropped))
+			total := db.usageLogDropped.Add(int64(dropped))
 			log.Printf("批量写入命中写不进去的日志：已丢弃 %d 条（累计 %d 条），其余继续落库。首个错误: %v",
 				dropped, total, err)
 		}
@@ -5298,10 +5298,6 @@ func (db *DB) getUsageStats(ctx context.Context, rangeStart, rangeEnd time.Time,
 		stats.ErrorRate = float64(todayErrors) / float64(stats.TodayRequests) * 100
 	}
 	if includeBreakdowns {
-		stats.ModelStats, err = db.getUsageModelStats(ctx, 10, rangeStart, rangeEnd, channel, dim)
-		if err != nil {
-			return nil, err
-		}
 		if err := db.populateUsageBreakdownStats(ctx, stats, rangeStart, rangeEnd, channel, dim); err != nil {
 			return nil, err
 		}
@@ -5367,16 +5363,20 @@ func (db *DB) usageStatsTimeWhere(column string, rangeStart, rangeEnd time.Time,
 	return where, args
 }
 
-func (db *DB) getUsageModelStats(ctx context.Context, limit int, rangeStart, rangeEnd time.Time, channel string, dim UsageLogFilter) ([]UsageModelStat, error) {
-	if limit <= 0 {
-		limit = 10
+// populateUsageBreakdownStats 用一次按(模型, 端点, API Key)分组的扫描填出模型排行(前 10)、
+// 端点/API Key 排行(前 8)与功能构成。以前是四条各扫一遍区间的聚合;分组数通常只有
+// 几十到几百行,排序取前 N 在 Go 里做。
+func (db *DB) populateUsageBreakdownStats(ctx context.Context, stats *UsageStats, rangeStart, rangeEnd time.Time, channel string, dim UsageLogFilter) error {
+	if stats == nil {
+		return nil
 	}
 	timeWhere, args := db.usageStatsTimeWhere("created_at", rangeStart, rangeEnd, channel, dim)
-	limitPlaceholder := fmt.Sprintf("$%d", len(args)+1)
-	args = append(args, limit)
 	rows, err := db.conn.QueryContext(ctx, `
 		SELECT
 			COALESCE(NULLIF(effective_model, ''), NULLIF(model, ''), 'unknown') AS model_name,
+			COALESCE(NULLIF(inbound_endpoint, ''), NULLIF(endpoint, ''), 'unknown') AS endpoint_name,
+			COALESCE(api_key_id, 0) AS api_key_id,
+			COALESCE(NULLIF(api_key_name, ''), NULLIF(api_key_masked, ''), 'unknown') AS api_key_label,
 			COUNT(*) AS requests,
 			COALESCE(SUM(total_tokens), 0) AS tokens,
 			COALESCE(SUM(input_tokens), 0) AS input_tokens,
@@ -5384,178 +5384,135 @@ func (db *DB) getUsageModelStats(ctx context.Context, limit int, rangeStart, ran
 			COALESCE(SUM(cached_tokens), 0) AS cached_tokens,
 			COALESCE(SUM(account_billed), 0) AS account_billed,
 			COALESCE(SUM(user_billed), 0) AS user_billed,
-			COALESCE(SUM(CASE WHEN status_code >= 400 THEN 1 ELSE 0 END), 0) AS error_count
-		FROM usage_logs u
-		WHERE `+timeWhere+` AND status_code <> 499
-		  AND TRIM(COALESCE(internal_reason, '')) = ''
-		GROUP BY 1
-		ORDER BY user_billed DESC, requests DESC, model_name ASC
-		LIMIT `+limitPlaceholder+`
-	`, args...)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	stats := make([]UsageModelStat, 0, limit)
-	for rows.Next() {
-		var item UsageModelStat
-		if err := rows.Scan(
-			&item.Model,
-			&item.Requests,
-			&item.Tokens,
-			&item.InputTokens,
-			&item.OutputTokens,
-			&item.CachedTokens,
-			&item.AccountBilled,
-			&item.UserBilled,
-			&item.ErrorCount,
-		); err != nil {
-			return nil, err
-		}
-		stats = append(stats, item)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-	if stats == nil {
-		stats = []UsageModelStat{}
-	}
-	return stats, nil
-}
-
-func (db *DB) populateUsageBreakdownStats(ctx context.Context, stats *UsageStats, rangeStart, rangeEnd time.Time, channel string, dim UsageLogFilter) error {
-	if stats == nil {
-		return nil
-	}
-	timeWhere, args := db.usageStatsTimeWhere("created_at", rangeStart, rangeEnd, channel, dim)
-	if err := db.conn.QueryRowContext(ctx, `
-		SELECT
+			COALESCE(SUM(CASE WHEN status_code >= 400 THEN 1 ELSE 0 END), 0) AS error_count,
 			COALESCE(SUM(CASE WHEN stream THEN 1 ELSE 0 END), 0) AS stream_requests,
 			COALESCE(SUM(CASE WHEN NOT stream THEN 1 ELSE 0 END), 0) AS sync_requests,
-				COALESCE(SUM(CASE WHEN LOWER(COALESCE(NULLIF(billing_service_tier, ''), service_tier, '')) IN ('fast', 'priority', 'ultrafast') THEN 1 ELSE 0 END), 0) AS fast_requests,
+			COALESCE(SUM(CASE WHEN LOWER(COALESCE(NULLIF(billing_service_tier, ''), service_tier, '')) IN ('fast', 'priority', 'ultrafast') THEN 1 ELSE 0 END), 0) AS fast_requests,
 			COALESCE(SUM(CASE WHEN cached_tokens > 0 THEN 1 ELSE 0 END), 0) AS cache_hit_requests,
 			COALESCE(SUM(CASE WHEN reasoning_tokens > 0 OR NULLIF(reasoning_effort, '') IS NOT NULL THEN 1 ELSE 0 END), 0) AS reasoning_requests,
 			COALESCE(SUM(CASE WHEN LOWER(COALESCE(NULLIF(inbound_endpoint, ''), endpoint, '')) LIKE '%/images/%' OR LOWER(COALESCE(model, '')) LIKE 'gpt-image-%' OR image_count > 0 THEN 1 ELSE 0 END), 0) AS image_requests,
 			-- attempt_index 是 1-based（首次尝试写 1，第一次重试写 2），所以「重试出来的请求」
 			-- 只能用 > 1。写成 > 0 会把每个请求都算进去，这个指标就恒等于总请求数（100%）；
 			-- is_retry_attempt 标的是「本次失败且将要重试」的那条失败记录，算进来会重复计一次。
-			COALESCE(SUM(CASE WHEN attempt_index > 1 THEN 1 ELSE 0 END), 0) AS retry_requests,
-			COALESCE(SUM(CASE WHEN status_code >= 400 THEN 1 ELSE 0 END), 0) AS error_requests
+			COALESCE(SUM(CASE WHEN attempt_index > 1 THEN 1 ELSE 0 END), 0) AS retry_requests
 		FROM usage_logs u
 		WHERE `+timeWhere+` AND status_code <> 499
 		  AND TRIM(COALESCE(internal_reason, '')) = ''
-	`, args...).Scan(
-		&stats.FeatureStats.StreamRequests,
-		&stats.FeatureStats.SyncRequests,
-		&stats.FeatureStats.FastRequests,
-		&stats.FeatureStats.CacheHitRequests,
-		&stats.FeatureStats.ReasoningRequests,
-		&stats.FeatureStats.ImageRequests,
-		&stats.FeatureStats.RetryRequests,
-		&stats.FeatureStats.ErrorRequests,
-	); err != nil {
+		GROUP BY 1, 2, 3, 4
+	`, args...)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+
+	type apiKeyGroup struct {
+		id    int64
+		label string
+	}
+	models := map[string]*UsageModelStat{}
+	endpoints := map[string]*UsageEndpointStat{}
+	apiKeys := map[apiKeyGroup]*UsageAPIKeyStat{}
+	features := UsageFeatureStat{}
+	for rows.Next() {
+		var g UsageModelStat
+		var endpoint string
+		var key apiKeyGroup
+		var stream, sync, fast, cacheHit, reasoning, image, retry int64
+		if err := rows.Scan(
+			&g.Model, &endpoint, &key.id, &key.label,
+			&g.Requests, &g.Tokens, &g.InputTokens, &g.OutputTokens, &g.CachedTokens,
+			&g.AccountBilled, &g.UserBilled, &g.ErrorCount,
+			&stream, &sync, &fast, &cacheHit, &reasoning, &image, &retry,
+		); err != nil {
+			return err
+		}
+		features.StreamRequests += stream
+		features.SyncRequests += sync
+		features.FastRequests += fast
+		features.CacheHitRequests += cacheHit
+		features.ReasoningRequests += reasoning
+		features.ImageRequests += image
+		features.RetryRequests += retry
+		features.ErrorRequests += g.ErrorCount
+
+		model := models[g.Model]
+		if model == nil {
+			model = &UsageModelStat{Model: g.Model}
+			models[g.Model] = model
+		}
+		model.Requests += g.Requests
+		model.Tokens += g.Tokens
+		model.InputTokens += g.InputTokens
+		model.OutputTokens += g.OutputTokens
+		model.CachedTokens += g.CachedTokens
+		model.AccountBilled += g.AccountBilled
+		model.UserBilled += g.UserBilled
+		model.ErrorCount += g.ErrorCount
+
+		ep := endpoints[endpoint]
+		if ep == nil {
+			ep = &UsageEndpointStat{Endpoint: endpoint}
+			endpoints[endpoint] = ep
+		}
+		ep.Requests += g.Requests
+		ep.Tokens += g.Tokens
+		ep.ErrorCount += g.ErrorCount
+		ep.UserBilled += g.UserBilled
+
+		ak := apiKeys[key]
+		if ak == nil {
+			ak = &UsageAPIKeyStat{APIKeyID: key.id, Label: key.label}
+			apiKeys[key] = ak
+		}
+		ak.Requests += g.Requests
+		ak.Tokens += g.Tokens
+		ak.ErrorCount += g.ErrorCount
+		ak.UserBilled += g.UserBilled
+	}
+	if err := rows.Err(); err != nil {
 		return err
 	}
 
-	endpoints, err := db.getUsageEndpointStats(ctx, 8, rangeStart, rangeEnd, channel, dim)
-	if err != nil {
-		return err
-	}
-	apiKeys, err := db.getUsageAPIKeyStats(ctx, 8, rangeStart, rangeEnd, channel, dim)
-	if err != nil {
-		return err
-	}
-	stats.EndpointStats = endpoints
-	stats.APIKeyStats = apiKeys
+	stats.FeatureStats = features
+	stats.ModelStats = topUsageStats(models, 10, func(a, b *UsageModelStat) bool {
+		if a.UserBilled != b.UserBilled {
+			return a.UserBilled > b.UserBilled
+		}
+		if a.Requests != b.Requests {
+			return a.Requests > b.Requests
+		}
+		return a.Model < b.Model
+	})
+	stats.EndpointStats = topUsageStats(endpoints, 8, func(a, b *UsageEndpointStat) bool {
+		if a.Requests != b.Requests {
+			return a.Requests > b.Requests
+		}
+		return a.Endpoint < b.Endpoint
+	})
+	stats.APIKeyStats = topUsageStats(apiKeys, 8, func(a, b *UsageAPIKeyStat) bool {
+		if a.Requests != b.Requests {
+			return a.Requests > b.Requests
+		}
+		return a.Label < b.Label
+	})
 	return nil
 }
 
-func (db *DB) getUsageEndpointStats(ctx context.Context, limit int, rangeStart, rangeEnd time.Time, channel string, dim UsageLogFilter) ([]UsageEndpointStat, error) {
-	if limit <= 0 {
-		limit = 8
-	}
-	timeWhere, args := db.usageStatsTimeWhere("created_at", rangeStart, rangeEnd, channel, dim)
-	limitPlaceholder := fmt.Sprintf("$%d", len(args)+1)
-	args = append(args, limit)
-	rows, err := db.conn.QueryContext(ctx, `
-		SELECT
-			COALESCE(NULLIF(inbound_endpoint, ''), NULLIF(endpoint, ''), 'unknown') AS endpoint_name,
-			COUNT(*) AS requests,
-			COALESCE(SUM(total_tokens), 0) AS tokens,
-			COALESCE(SUM(CASE WHEN status_code >= 400 THEN 1 ELSE 0 END), 0) AS error_count,
-			COALESCE(SUM(user_billed), 0) AS user_billed
-		FROM usage_logs u
-		WHERE `+timeWhere+` AND status_code <> 499
-		  AND TRIM(COALESCE(internal_reason, '')) = ''
-		GROUP BY 1
-		ORDER BY requests DESC, endpoint_name ASC
-		LIMIT `+limitPlaceholder+`
-	`, args...)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	items := make([]UsageEndpointStat, 0, limit)
-	for rows.Next() {
-		var item UsageEndpointStat
-		if err := rows.Scan(&item.Endpoint, &item.Requests, &item.Tokens, &item.ErrorCount, &item.UserBilled); err != nil {
-			return nil, err
-		}
+// topUsageStats 按 less 排序后取前 limit 项(值拷贝),空时返回非 nil 空切片。
+func topUsageStats[K comparable, T any](byKey map[K]*T, limit int, less func(a, b *T) bool) []T {
+	items := make([]*T, 0, len(byKey))
+	for _, item := range byKey {
 		items = append(items, item)
 	}
-	if err := rows.Err(); err != nil {
-		return nil, err
+	sort.Slice(items, func(i, j int) bool { return less(items[i], items[j]) })
+	if len(items) > limit {
+		items = items[:limit]
 	}
-	if items == nil {
-		items = []UsageEndpointStat{}
+	out := make([]T, len(items))
+	for i, item := range items {
+		out[i] = *item
 	}
-	return items, nil
-}
-
-func (db *DB) getUsageAPIKeyStats(ctx context.Context, limit int, rangeStart, rangeEnd time.Time, channel string, dim UsageLogFilter) ([]UsageAPIKeyStat, error) {
-	if limit <= 0 {
-		limit = 8
-	}
-	timeWhere, args := db.usageStatsTimeWhere("created_at", rangeStart, rangeEnd, channel, dim)
-	limitPlaceholder := fmt.Sprintf("$%d", len(args)+1)
-	args = append(args, limit)
-	rows, err := db.conn.QueryContext(ctx, `
-		SELECT
-			COALESCE(api_key_id, 0) AS api_key_id,
-			COALESCE(NULLIF(api_key_name, ''), NULLIF(api_key_masked, ''), 'unknown') AS api_key_label,
-			COUNT(*) AS requests,
-			COALESCE(SUM(total_tokens), 0) AS tokens,
-			COALESCE(SUM(CASE WHEN status_code >= 400 THEN 1 ELSE 0 END), 0) AS error_count,
-			COALESCE(SUM(user_billed), 0) AS user_billed
-		FROM usage_logs u
-		WHERE `+timeWhere+` AND status_code <> 499
-		  AND TRIM(COALESCE(internal_reason, '')) = ''
-		GROUP BY 1, 2
-		ORDER BY requests DESC, api_key_label ASC
-		LIMIT `+limitPlaceholder+`
-	`, args...)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	items := make([]UsageAPIKeyStat, 0, limit)
-	for rows.Next() {
-		var item UsageAPIKeyStat
-		if err := rows.Scan(&item.APIKeyID, &item.Label, &item.Requests, &item.Tokens, &item.ErrorCount, &item.UserBilled); err != nil {
-			return nil, err
-		}
-		items = append(items, item)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-	if items == nil {
-		items = []UsageAPIKeyStat{}
-	}
-	return items, nil
+	return out
 }
 
 // GetTrafficSnapshot 获取近实时流量快照
@@ -6435,7 +6392,6 @@ func (db *DB) GetUsageErrorSummary(ctx context.Context, f UsageLogFilter) (*Usag
 		COALESCE(SUM(CASE WHEN COALESCE(u.is_retry_attempt, false) THEN 1 ELSE 0 END), 0),
 		COALESCE(AVG(u.duration_ms), 0)
 		FROM usage_logs u
-		LEFT JOIN accounts a ON u.account_id = a.id
 		WHERE ` + where
 
 	result := &UsageErrorSummary{}
@@ -6465,9 +6421,24 @@ func (db *DB) ListUsageLogsByTimeRangePaged(ctx context.Context, f UsageLogFilte
 	}
 
 	where, args := db.buildUsageLogWhere(f)
+
+	// 总数单独计数:不 JOIN 账号、不取宽列;默认筛选(时间 + 排除 499)只走
+	// (created_at, status_code) 覆盖索引。以前用 COUNT(*) OVER() 和分页同查,
+	// SQLite 会把整个区间的宽行连同账号凭据物化进临时 B-tree 全量排序后才 LIMIT,
+	// 慢盘部署上 7 天区间就能超时。
+	result := &UsageLogPage{Logs: []*UsageLog{}}
+	if err := db.conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM usage_logs u WHERE `+where, args...).Scan(&result.Total); err != nil {
+		return nil, err
+	}
 	offset := (f.Page - 1) * f.PageSize
+	if result.Total == 0 || int64(offset) >= result.Total {
+		return result, nil
+	}
+
+	// 先按索引顺序只取本页 id,再回表取宽列并关联账号:宽列与凭据只读 page_size 行。
+	// id 作次级排序键:批量落库会产生大量同一时刻的记录,没有确定顺序时翻页会重复/漏行。
 	paramIdx := len(args) + 1
-	where += fmt.Sprintf(` ORDER BY u.created_at DESC LIMIT $%d OFFSET $%d`, paramIdx, paramIdx+1)
+	pageIDs := fmt.Sprintf(`SELECT u.id FROM usage_logs u WHERE %s ORDER BY u.created_at DESC, u.id DESC LIMIT $%d OFFSET $%d`, where, paramIdx, paramIdx+1)
 	args = append(args, f.PageSize, offset)
 
 	query := `SELECT u.id, u.account_id, COALESCE(u.client_ip, ''), u.endpoint, u.model, COALESCE(u.effective_model, ''), COALESCE(u.upstream_response_model, ''), u.upstream_model_mismatch, u.prompt_tokens, u.completion_tokens, u.total_tokens, u.status_code, u.duration_ms,
@@ -6482,11 +6453,11 @@ func (db *DB) ListUsageLogsByTimeRangePaged(ctx context.Context, f UsageLogFilte
 			            COALESCE(u.is_retry_attempt, false), COALESCE(u.attempt_index, 0), COALESCE(u.upstream_error_kind, ''), COALESCE(u.error_message, ''),
 			            COALESCE(u.client_user_agent, ''), COALESCE(u.upstream_user_agent, ''), COALESCE(u.user_agent_overridden, false), COALESCE(u.turn_state_overridden, false), COALESCE(u.turn_state_rewrite_note, ''), COALESCE(u.channel, ''),
 			            COALESCE(u.internal_reason, ''), COALESCE(u.parent_request_id, ''), COALESCE(u.prompt_policy_incident_id, ''), COALESCE(u.request_id, ''), COALESCE(u.upstream_request_id, ''), COALESCE(u.upstream_proxy_id, 0), COALESCE(u.upstream_proxy_name, ''), COALESCE(u.injected_turn_state, ''), COALESCE(u.upstream_turn_state, ''), COALESCE(u.daybreak_program, ''),
-			            COALESCE(CAST(a.credentials AS TEXT), '{}'), COALESCE(a.name, ''), u.created_at,
-	            COUNT(*) OVER() AS total_count
-	           FROM usage_logs u
+			            COALESCE(CAST(a.credentials AS TEXT), '{}'), COALESCE(a.name, ''), u.created_at
+	           FROM (` + pageIDs + `) page
+	           JOIN usage_logs u ON u.id = page.id
 	           LEFT JOIN accounts a ON u.account_id = a.id
-	           WHERE ` + where
+	           ORDER BY u.created_at DESC, u.id DESC`
 
 	rows, err := db.conn.QueryContext(ctx, query, args...)
 	if err != nil {
@@ -6494,7 +6465,6 @@ func (db *DB) ListUsageLogsByTimeRangePaged(ctx context.Context, f UsageLogFilte
 	}
 	defer rows.Close()
 
-	result := &UsageLogPage{}
 	for rows.Next() {
 		l := &UsageLog{}
 		var credentialRaw interface{}
@@ -6506,7 +6476,7 @@ func (db *DB) ListUsageLogsByTimeRangePaged(ctx context.Context, f UsageLogFilte
 			&l.ServiceTier, &l.RequestedServiceTier, &l.ActualServiceTier, &l.BillingServiceTier, &l.APIKeyID, &l.APIKeyName, &l.APIKeyMasked, &l.ImageCount, &l.ImageWidth, &l.ImageHeight, &l.ImageBytes, &l.ImageFormat, &l.ImageSize,
 			&l.AccountBilled, &l.UserBilled, &l.UserBillingMode, &l.ImageUnitPrice, &l.BilledImageCount, &l.VideoSeconds, &l.IsRetryAttempt, &l.AttemptIndex, &l.UpstreamErrorKind, &l.ErrorMessage,
 			&l.ClientUserAgent, &l.UpstreamUserAgent, &l.UserAgentOverridden, &l.TurnStateOverridden, &l.TurnStateRewriteNote, &l.Channel, &l.InternalReason, &l.ParentRequestID, &l.PromptPolicyIncidentID, &l.RequestID, &l.UpstreamRequestID, &l.UpstreamProxyID, &l.UpstreamProxyName, &l.InjectedTurnState, &l.UpstreamTurnState, &l.DaybreakProgram,
-			&credentialRaw, &l.AccountName, &createdAtRaw, &result.Total); err != nil {
+			&credentialRaw, &l.AccountName, &createdAtRaw); err != nil {
 			return nil, err
 		}
 		l.AccountEmail = accountEmailFromRawCredentials(credentialRaw)
@@ -6521,9 +6491,6 @@ func (db *DB) ListUsageLogsByTimeRangePaged(ctx context.Context, f UsageLogFilte
 		}
 		l.populateBillingBreakdown()
 		result.Logs = append(result.Logs, l)
-	}
-	if result.Logs == nil {
-		result.Logs = []*UsageLog{}
 	}
 	return result, rows.Err()
 }
