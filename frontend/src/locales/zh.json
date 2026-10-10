@@ -2567,6 +2567,7 @@
     "customRangeInvalid": "时间格式不正确",
     "customRangeEndBeforeStart": "结束时间必须晚于开始时间",
     "customRangeTooLong": "区间不能超过 {{days}} 天",
+    "statsLoadFailed": "这个区间的统计没有加载出来，下面的数字不是当前筛选的结果",
     "totalTokensCard": "总 Token 数",
     "inputTokens": "输入",
     "outputTokens": "输出",
