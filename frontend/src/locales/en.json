@@ -2567,6 +2567,7 @@
     "customRangeInvalid": "Invalid datetime",
     "customRangeEndBeforeStart": "End must be after start",
     "customRangeTooLong": "Range cannot exceed {{days}} days",
+    "statsLoadFailed": "Stats for this range failed to load; the numbers below are not for the current filters",
     "totalTokensCard": "Total Tokens",
     "inputTokens": "Input",
     "outputTokens": "Output",
