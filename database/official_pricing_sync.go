@@ -73,10 +73,27 @@ func (db *DB) ensureOfficialPricingSyncConfig(ctx context.Context) error {
 	return err
 }
 
+// GetOfficialPricingSyncConfig 先直接读,读不到(新库、缺列、缺种子行)才建表补种子再读。
+// 种子行的 INSERT 要拿写锁;慢盘 SQLite 启动时正赶上用量回填长时间占着写锁,
+// 每次启动都先跑一遍会让这条只读查询等到超时。
 func (db *DB) GetOfficialPricingSyncConfig(ctx context.Context) (*OfficialPricingSyncConfig, error) {
+	if db == nil || db.conn == nil {
+		return nil, fmt.Errorf("数据库不可用")
+	}
+	if cfg, err := db.readOfficialPricingSyncConfig(ctx); err == nil {
+		// 能读出完整一行说明表、列、种子行都在,后续写入不必再跑建表。
+		officialPricingConfigInitMu.Lock()
+		officialPricingConfigReady[db] = true
+		officialPricingConfigInitMu.Unlock()
+		return cfg, nil
+	}
 	if err := db.ensureOfficialPricingSyncConfig(ctx); err != nil {
 		return nil, err
 	}
+	return db.readOfficialPricingSyncConfig(ctx)
+}
+
+func (db *DB) readOfficialPricingSyncConfig(ctx context.Context) (*OfficialPricingSyncConfig, error) {
 	var cfg OfficialPricingSyncConfig
 	err := db.conn.QueryRowContext(ctx, `SELECT enabled, interval_minutes, include_openai, include_grok, include_claude,
 		last_attempt_at, last_success_at, COALESCE(last_error, ''), COALESCE(last_warning, '')
