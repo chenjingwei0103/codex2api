@@ -661,7 +661,7 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 				apiErr = compactionUpstreamUnavailableAPIError()
 			} else if lastRetryableUpstreamErr != nil {
 				apiErr = responsesWSClientUpstreamAPIError(lastRetryableUpstreamErr, hideUpstreamErrors)
-			} else if lastStatusCode == http.StatusTooManyRequests && len(lastBody) > 0 {
+			} else if (lastStatusCode == http.StatusTooManyRequests && len(lastBody) > 0) || lastFailureModelUnsupported(lastStatusCode, lastBody) {
 				apiErr = responsesWSUpstreamAPIError(lastStatusCode, lastBody)
 			} else if msg := scopeBudgetExhaustedMessage(c); msg != "" {
 				// 候选被 scope 预算剔空（issue #439）：按限流语义回帧，而不是「无可用账号」。
@@ -671,6 +671,8 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 				apiErr = api.NewAPIError(api.ErrCodeRateLimitReached, usageLimitedPoolMessages(limited).Chinese, api.ErrorTypeRateLimit)
 			} else if h.accountPoolConcurrencySaturated(apiKeyID, retryExclusions.ForSelection(), accountFilter, dispatchPolicy) {
 				apiErr = api.NewAPIError(api.ErrorCode(ErrorCodeAccountPoolConcurrencySaturated), concurrencySaturatedMessageZH, api.ErrorTypeServer)
+			} else if msg, ok := h.unsupportedModelPoolMessage(apiKeyID, retryExclusions.ForSelection(), effectiveModel, dispatchPolicy); ok {
+				apiErr = api.NewAPIError(api.ErrorCode(auth.ModelCooldownReasonUnsupported), msg, api.ErrorTypeInvalidRequest)
 			} else {
 				apiErr = api.NewAPIError(api.ErrCodeServiceUnavailable, noAvailableAccountMessage(effectiveModel), api.ErrorTypeServer)
 			}
@@ -945,7 +947,7 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 				continue
 			}
 
-			if kind := classifyHTTPFailure(resp.StatusCode); kind != "" {
+			if kind := classifyHTTPFailure(resp.StatusCode, errBody); kind != "" {
 				h.store.ReportRequestFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
 			}
 			SyncCodexUsageState(h.store, account, resp)

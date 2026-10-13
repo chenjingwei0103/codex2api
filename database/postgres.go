@@ -1579,6 +1579,7 @@ func (db *DB) migrate(ctx context.Context) error {
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS oauth_model_cooldown_mode VARCHAR(20) NOT NULL DEFAULT 'adaptive';
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS oauth_model_cooldown_seconds INT NOT NULL DEFAULT 300;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS oauth_model_cooldown_backoff_enabled BOOLEAN NOT NULL DEFAULT TRUE;
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS oauth_unsupported_model_cooldown_seconds INT NOT NULL DEFAULT 1800;
 
 	ALTER TABLE account_groups ADD COLUMN IF NOT EXISTS auto_pause_5h_threshold DOUBLE PRECISION DEFAULT 0;
 	ALTER TABLE account_groups ADD COLUMN IF NOT EXISTS auto_pause_7d_threshold DOUBLE PRECISION DEFAULT 0;
@@ -2538,6 +2539,9 @@ type SystemSettings struct {
 	OAuthModelCooldownMode           string
 	OAuthModelCooldownSeconds        int
 	OAuthModelCooldownBackoffEnabled bool
+	// Zero values keep the unsupported-model cooldown enabled at its default.
+	OAuthUnsupportedModelCooldownDisabled bool
+	OAuthUnsupportedModelCooldownSeconds  int
 
 	// PreservePromptFilterCustomPatterns is an update-only concurrency guard.
 	// When true, an existing row keeps its current custom-pattern value instead

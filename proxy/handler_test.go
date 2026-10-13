@@ -3728,6 +3728,109 @@ func TestResponseFailedModelUnsupportedRetryable(t *testing.T) {
 	}
 }
 
+func TestUnsupportedModelCooldownFollowsSettingAndSkipsHealth(t *testing.T) {
+	body := []byte(`{"error":{"message":"The 'gpt-5.6-sol' model is not supported when using Codex with a ChatGPT account.","type":"invalid_request_error"}}`)
+	resp := &http.Response{Header: make(http.Header)}
+
+	store := auth.NewStore(nil, nil, &database.SystemSettings{MaxConcurrency: 2, TestConcurrency: 1, TestModel: "gpt-5.5"})
+	defer store.Stop()
+	account := &auth.Account{DBID: 1, AccessToken: "at", PlanType: "free", Status: auth.StatusReady}
+	store.AddAccount(account)
+	handler := &Handler{store: store}
+	failureStreak := func() int {
+		account.Mu().RLock()
+		defer account.Mu().RUnlock()
+		return account.FailureStreak
+	}
+
+	decision := handler.applyCooldownForModel(account, http.StatusBadRequest, body, resp, "gpt-5.6-sol")
+	if decision.Reason != auth.ModelCooldownReasonUnsupported || time.Until(decision.ResetAt) < 29*time.Minute {
+		t.Fatalf("decision = %#v, want default 30m cooldown", decision)
+	}
+	if streak := failureStreak(); streak != 0 {
+		t.Fatalf("failure streak = %d, unsupported model must not count as account failure", streak)
+	}
+	if kind := classifyHTTPFailure(http.StatusBadRequest, body); kind != "" {
+		t.Fatalf("classifyHTTPFailure = %q, want no health report", kind)
+	}
+	if kind := classifyHTTPFailure(http.StatusBadRequest, []byte(`{"error":{"message":"bad"}}`)); kind != "client" {
+		t.Fatalf("ordinary 400 kind = %q, want client", kind)
+	}
+	payload := []byte(`{"type":"response.failed","response":{"error":{"code":"invalid_request_error","message":"The 'gpt-5.6-sol' model is not supported when using Codex with a ChatGPT account."}}}`)
+	outcome := classifyResponseFailedOutcome(payload)
+	if !outcome.penalize || !outcome.modelUnsupported {
+		t.Fatalf("outcome = %#v, want retryable but health-neutral", outcome)
+	}
+	handler.reportStreamOutcomeFailure(account, outcome, time.Millisecond)
+	if failureStreak() != 0 {
+		t.Fatal("stream unsupported-model failure must not count as account failure")
+	}
+
+	store.ClearAllModelCooldowns(account)
+	store.SetModelCooldownSettings(database.ModelCooldownSettings{OAuthUnsupportedDisabled: true})
+	decision = handler.applyCooldownForModel(account, http.StatusBadRequest, body, resp, "gpt-5.6-sol")
+	if !decision.ResetAt.IsZero() || account.IsModelRateLimited("gpt-5.6-sol") {
+		t.Fatalf("disabled setting still wrote a cooldown: %#v", decision)
+	}
+}
+
+func TestUnsupportedModelPoolReturnsModelNotSupportedError(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	originalWait := dispatchAccountWaitTimeout
+	dispatchAccountWaitTimeout = 20 * time.Millisecond
+	t.Cleanup(func() { dispatchAccountWaitTimeout = originalWait })
+
+	store := auth.NewStore(nil, nil, &database.SystemSettings{MaxConcurrency: 2, TestModel: "gpt-5.5"})
+	defer store.Stop()
+	for id := int64(1); id <= 2; id++ {
+		account := &auth.Account{DBID: id, AccessToken: fmt.Sprintf("at-%d", id), PlanType: "free", AccountID: fmt.Sprintf("acct-%d", id), Status: auth.StatusReady}
+		store.AddAccount(account)
+		store.MarkModelUnsupported(account, "gpt-5.5", 10*time.Minute)
+	}
+	handler := NewHandler(store, nil, nil, nil)
+
+	tests := []struct {
+		name    string
+		path    string
+		body    string
+		handler gin.HandlerFunc
+	}{
+		{name: "responses", path: "/v1/responses", body: `{"model":"gpt-5.5","input":"hello"}`, handler: handler.Responses},
+		{name: "chat", path: "/v1/chat/completions", body: `{"model":"gpt-5.5","messages":[{"role":"user","content":"hello"}]}`, handler: handler.ChatCompletions},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodPost, test.path, strings.NewReader(test.body))
+			req.Header.Set("Content-Type", "application/json")
+			recorder := httptest.NewRecorder()
+			ginCtx, _ := gin.CreateTestContext(recorder)
+			ginCtx.Request = req
+
+			test.handler(ginCtx)
+
+			if recorder.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, want 400; body=%s", recorder.Code, recorder.Body.String())
+			}
+			if code := gjson.Get(recorder.Body.String(), "error.code").String(); code != auth.ModelCooldownReasonUnsupported {
+				t.Fatalf("code = %q, want model_not_supported; body=%s", code, recorder.Body.String())
+			}
+			if message := gjson.Get(recorder.Body.String(), "error.message").String(); !strings.Contains(message, "not supported when using Codex") {
+				t.Fatalf("message = %q, want the upstream reason", message)
+			}
+		})
+	}
+}
+
+func TestLastFailureModelUnsupported(t *testing.T) {
+	body := []byte(`{"error":{"message":"The 'gpt-5.6-sol' model is not supported when using Codex with a ChatGPT account."}}`)
+	if !lastFailureModelUnsupported(http.StatusBadRequest, body) {
+		t.Fatal("unsupported-model 400 must be passed through")
+	}
+	if lastFailureModelUnsupported(http.StatusBadRequest, []byte(`{"error":{"message":"bad"}}`)) || lastFailureModelUnsupported(http.StatusTooManyRequests, body) || lastFailureModelUnsupported(0, nil) {
+		t.Fatal("only the unsupported-model 400 qualifies")
+	}
+}
+
 func TestAccountFilterForSparkAllowsNonFreeOrUnknownPlans(t *testing.T) {
 	filter := accountFilterForModel("gpt-5.3-codex-spark")
 	if filter == nil {

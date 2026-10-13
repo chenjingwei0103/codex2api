@@ -81,9 +81,11 @@ func TestImageQueueAcceptsThousandWithoutFetchingOrKeySlots(t *testing.T) {
 	}
 }
 
-func TestImageQueueBoundsClaimedTasksWithThousandBacklog(t *testing.T) {
+// A key saturated by its own long-lived requests must not park workers on its
+// backlog: its jobs stay queued while other keys' jobs keep executing.
+func TestImageQueueSaturatedKeyDoesNotStarveOtherKeys(t *testing.T) {
 	t.Setenv("IMAGE_JOB_WORKERS", "2")
-	t.Setenv("IMAGE_JOB_MEMORY_WORKERS", "1")
+	t.Setenv("IMAGE_JOB_MEMORY_WORKERS", "")
 	_, imageProxy, db := newExternalImageJobRouter(t, database.APIKeyLimits{MaxConcurrency: 1}, "sk-backlog")
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -91,14 +93,22 @@ func TestImageQueueBoundsClaimedTasksWithThousandBacklog(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for i := 0; i < 1000; i++ {
+	const backlog = 1000
+	for i := 0; i < backlog; i++ {
 		if _, err := db.InsertImageGenerationJob(ctx, database.ImageGenerationJobInput{APIKeyID: key.ID, ParamsJSON: `{"prompt":"test","n":1,"model":"gpt-image-2"}`}); err != nil {
 			t.Fatal(err)
 		}
 	}
-	// Hold the key so claimed workers wait without sending billable requests.
 	release := occupyAPIKeyConcurrency(t, imageProxy, "sk-backlog")
 	defer release()
+	otherKeyID, err := db.InsertAPIKey(ctx, "other", "sk-other")
+	if err != nil {
+		t.Fatal(err)
+	}
+	otherJob, err := db.InsertImageGenerationJob(ctx, database.ImageGenerationJobInput{APIKeyID: otherKeyID, ParamsJSON: `{"prompt":"test","n":1,"model":"gpt-image-2"}`})
+	if err != nil {
+		t.Fatal(err)
+	}
 	h := &Handler{db: db, imageProxy: imageProxy}
 	if err := h.StartImageJobQueue(ctx, 2); err != nil {
 		t.Fatal(err)
@@ -109,23 +119,123 @@ func TestImageQueueBoundsClaimedTasksWithThousandBacklog(t *testing.T) {
 		proxy.ConfigureImageExecutionLimit(0)
 		proxy.ConfigureImagePipeline(0)
 	})
-	// Observe multiple dispatch ticks: detached, unbounded workers would keep
-	// claiming more jobs while the first two are still waiting on this key.
-	deadline := time.Now().Add(3500 * time.Millisecond)
-	claimed := false
-	for time.Now().Before(deadline) {
-		ids, err := db.QueuedImageJobIDs(ctx, 1000)
+	assertBacklogQueued := func() {
+		t.Helper()
+		n, err := db.CountQueuedImageJobsByKey(ctx, key.ID)
 		if err != nil {
 			t.Fatal(err)
 		}
-		if len(ids) < 998 {
-			t.Fatalf("worker cap exceeded: %d claimed", 1000-len(ids))
+		if n != backlog {
+			t.Fatalf("saturated key had %d jobs claimed", backlog-n)
 		}
-		claimed = claimed || len(ids) == 998
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		assertBacklogQueued()
+		job, err := db.GetImageGenerationJob(ctx, otherJob)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if job.Status != database.ImageJobQueued {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("other key's job was starved by the saturated key")
+		}
 		time.Sleep(50 * time.Millisecond)
 	}
-	if !claimed {
-		t.Fatal("workers did not claim the backlog")
+	// Keep observing a few dispatch ticks.
+	for end := time.Now().Add(1500 * time.Millisecond); time.Now().Before(end); time.Sleep(100 * time.Millisecond) {
+		assertBacklogQueued()
+	}
+}
+
+func TestImageQueueCapsQueuedJobsPerKey(t *testing.T) {
+	db := newTestAdminDB(t)
+	if err := db.InitImageJobQueue(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.InsertAPIKey(context.Background(), "capped", "sk-capped"); err != nil {
+		t.Fatal(err)
+	}
+	tc := cache.NewMemory(1)
+	defer tc.Close()
+	store := auth.NewStore(db, tc, nil)
+	defer store.Stop()
+	h := NewHandler(store, db, tc, nil, "")
+	h.imageQueue = &imageJobQueue{intake: make(chan struct{}, 2), maxQueuedPerKey: 2}
+	r := gin.New()
+	h.RegisterExternalImageRoutes(r, proxy.NewHandler(store, db, nil, nil))
+	for i, want := range []int{http.StatusAccepted, http.StatusAccepted, http.StatusTooManyRequests} {
+		w := httptest.NewRecorder()
+		req := httptest.NewRequest("POST", "/v1/images/jobs", strings.NewReader(`{"model":"gpt-image-2","prompt":"cap test"}`))
+		req.Header.Set("Authorization", "Bearer sk-capped")
+		req.Header.Set("Content-Type", "application/json")
+		r.ServeHTTP(w, req)
+		if w.Code != want {
+			t.Fatalf("request %d: status=%d want %d: %s", i, w.Code, want, w.Body.String())
+		}
+	}
+	ids, err := db.QueuedImageJobIDs(context.Background(), 10)
+	if err != nil || len(ids) != 2 {
+		t.Fatalf("queued=%v err=%v", ids, err)
+	}
+}
+
+func TestImageQueueFailsJobsThatNeverStarted(t *testing.T) {
+	t.Setenv("IMAGE_ASSET_DIR", t.TempDir())
+	db := newTestAdminDB(t)
+	ctx := context.Background()
+	if err := db.InitImageJobQueue(ctx); err != nil {
+		t.Fatal(err)
+	}
+	keyID, err := db.InsertAPIKey(ctx, "stale", "sk-stale")
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := imageGenerationJobPayload{Prompt: "test", Model: "gpt-image-2", N: 1, InputImages: []string{"data:image/png;base64," + base64.StdEncoding.EncodeToString(tinyPNG(t))}}
+	if err = prepareQueueInputs(&req); err != nil {
+		t.Fatal(err)
+	}
+	path, _ := queueInputPath(req.InputImages[0])
+	params, _ := json.Marshal(req)
+	id, err := db.InsertImageGenerationJob(ctx, database.ImageGenerationJobInput{Prompt: req.Prompt, ParamsJSON: string(params), APIKeyID: keyID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := &Handler{db: db, imageQueue: &imageJobQueue{maxQueueWait: time.Millisecond}}
+	// created_at has second precision.
+	time.Sleep(1100 * time.Millisecond)
+	h.failStaleQueuedImages(ctx)
+	job, err := db.GetImageGenerationJob(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if job.Status != database.ImageJobFailed || !strings.Contains(job.ErrorMessage, "排队") {
+		t.Fatalf("stale job not failed: %+v", job)
+	}
+	if _, err = os.Stat(path); !os.IsNotExist(err) {
+		t.Fatal("spooled input retained for expired job")
+	}
+}
+
+func TestImageJobQueueLimitsFromEnv(t *testing.T) {
+	t.Setenv("IMAGE_JOB_MAX_QUEUED_PER_KEY", "")
+	t.Setenv("IMAGE_JOB_MAX_QUEUE_WAIT", "")
+	if n, d, err := imageJobQueueLimits(); err != nil || n != defaultMaxQueuedPerKey || d != defaultMaxQueueWait {
+		t.Fatalf("defaults: %d %s %v", n, d, err)
+	}
+	t.Setenv("IMAGE_JOB_MAX_QUEUED_PER_KEY", "0")
+	t.Setenv("IMAGE_JOB_MAX_QUEUE_WAIT", "0")
+	if n, d, err := imageJobQueueLimits(); err != nil || n != 0 || d != 0 {
+		t.Fatalf("disabled: %d %s %v", n, d, err)
+	}
+	for _, bad := range [][2]string{{"-1", "1h"}, {"x", "1h"}, {"10", "30s"}, {"10", "-1h"}, {"10", "soon"}} {
+		t.Setenv("IMAGE_JOB_MAX_QUEUED_PER_KEY", bad[0])
+		t.Setenv("IMAGE_JOB_MAX_QUEUE_WAIT", bad[1])
+		if _, _, err := imageJobQueueLimits(); err == nil {
+			t.Fatalf("accepted %v", bad)
+		}
 	}
 }
 

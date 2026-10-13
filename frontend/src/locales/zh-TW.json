@@ -669,6 +669,8 @@
     "modelCooldownSecondsDesc": "範圍 1–1800 秒。",
     "modelCooldownBackoff": "指數退避",
     "modelCooldownBackoffDesc": "僅自適應模式生效。",
+    "unsupportedModelCooldownSeconds": "不支援模型冷卻",
+    "unsupportedModelCooldownSecondsDesc": "上游回傳「model is not supported when using Codex with a ChatGPT account」時，該帳號在此時長內不再調度這個模型，不影響其他模型與帳號健康度。0 表示關閉（同一請求內仍會換號重試）；調小或關閉時會自動清除超出新時長的既有冷卻。混用免費/付費帳號時，建議在帳號詳情設定支援模型白名單。",
     "sessionSlotBuffer": "會話並發槽緩衝",
     "sessionSlotBufferDesc": "成功請求結束後，為原會話短暫保留帳號並發槽；同一會話可立即取回，其他新會話不能搶佔。失敗和重試仍立即釋放，正在執行的請求不會中斷。每次都產生新親和鍵的短請求也會佔用到期，因此緩衝時間越長，吞吐下降越明顯。預設關閉。",
     "sessionSlotBufferSeconds": "緩衝時間（秒）",

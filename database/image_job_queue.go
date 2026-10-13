@@ -21,8 +21,63 @@ func (db *DB) InitImageJobQueue(ctx context.Context) error {
 			return err
 		}
 	}
-	_, err := db.conn.ExecContext(ctx, `CREATE INDEX IF NOT EXISTS idx_image_jobs_queue_status_id ON image_generation_jobs(status,id)`)
-	return err
+	for _, q := range []string{
+		`CREATE INDEX IF NOT EXISTS idx_image_jobs_queue_status_id ON image_generation_jobs(status,id)`,
+		`CREATE INDEX IF NOT EXISTS idx_image_jobs_queue_status_key_id ON image_generation_jobs(status,api_key_id,id)`,
+	} {
+		if _, err := db.conn.ExecContext(ctx, q); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// QueuedImageJobHead is the oldest queued job of one API key.
+type QueuedImageJobHead struct {
+	ID       int64
+	APIKeyID int64
+}
+
+// QueuedImageJobHeads returns at most one candidate per API key, oldest first,
+// so a key with a deep backlog occupies a single dispatch slot.
+func (db *DB) QueuedImageJobHeads(ctx context.Context, limit int) ([]QueuedImageJobHead, error) {
+	rows, err := db.conn.QueryContext(ctx, `SELECT MIN(id), COALESCE(api_key_id,0) FROM image_generation_jobs WHERE status=$1 GROUP BY COALESCE(api_key_id,0) ORDER BY 1 LIMIT $2`, ImageJobQueued, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var heads []QueuedImageJobHead
+	for rows.Next() {
+		var head QueuedImageJobHead
+		if err := rows.Scan(&head.ID, &head.APIKeyID); err != nil {
+			return nil, err
+		}
+		heads = append(heads, head)
+	}
+	return heads, rows.Err()
+}
+
+func (db *DB) CountQueuedImageJobsByKey(ctx context.Context, apiKeyID int64) (int, error) {
+	var n int
+	err := db.conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM image_generation_jobs WHERE status=$1 AND api_key_id=$2`, ImageJobQueued, apiKeyID).Scan(&n)
+	return n, err
+}
+
+func (db *DB) StaleQueuedImageJobIDs(ctx context.Context, createdBefore time.Time, limit int) ([]int64, error) {
+	rows, err := db.conn.QueryContext(ctx, `SELECT id FROM image_generation_jobs WHERE status=$1 AND created_at<$2 ORDER BY id LIMIT $3`, ImageJobQueued, db.imageRetentionCutoff(createdBefore), limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var ids []int64
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	return ids, rows.Err()
 }
 
 // Candidate IDs only: never load every queued job's inputs into memory.

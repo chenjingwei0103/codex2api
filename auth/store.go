@@ -4361,6 +4361,9 @@ func NewStore(db *database.DB, tc cache.TokenCache, settings *database.SystemSet
 		OAuthMode:           settings.OAuthModelCooldownMode,
 		OAuthSeconds:        settings.OAuthModelCooldownSeconds,
 		OAuthBackoffEnabled: settings.OAuthModelCooldownBackoffEnabled,
+
+		OAuthUnsupportedDisabled: settings.OAuthUnsupportedModelCooldownDisabled,
+		OAuthUnsupportedSeconds:  settings.OAuthUnsupportedModelCooldownSeconds,
 	})
 
 	s.globalAutoPause5hThreshold = normalizeQuotaAutoPauseThreshold(settings.AutoPause5hThreshold)
@@ -10282,6 +10285,105 @@ func (s *Store) ClearAllModelCooldowns(acc *Account) int {
 		}
 	}
 	return len(models)
+}
+
+// ModelCooldownReasonUnsupported marks the plan-gated Codex 400 "model is not
+// supported when using Codex with a ChatGPT account".
+const ModelCooldownReasonUnsupported = "model_not_supported"
+
+// UnsupportedModelCooldown returns the configured cooldown for the plan-gated
+// unsupported-model 400; zero when disabled.
+func (s *Store) UnsupportedModelCooldown() time.Duration {
+	settings := s.GetModelCooldownSettings()
+	return time.Duration(settings.UnsupportedCooldownSeconds()) * time.Second
+}
+
+// MarkModelUnsupported cools (account, model) down without touching account
+// health: a plan that cannot serve one model says nothing about the others.
+func (s *Store) MarkModelUnsupported(acc *Account, model string, duration time.Duration) ModelCooldown {
+	if s == nil || acc == nil || duration <= 0 {
+		return ModelCooldown{}
+	}
+	if duration > 30*time.Minute {
+		duration = 30 * time.Minute
+	}
+	resetAt := time.Now().Add(duration)
+	if remaining := acc.ModelCooldownRemaining(model); remaining > duration {
+		resetAt = time.Now().Add(remaining)
+	}
+	cooldown := acc.SetModelCooldownUntil(model, ModelCooldownReasonUnsupported, resetAt)
+	if cooldown.Model == "" {
+		return cooldown
+	}
+	s.fastSchedulerUpdate(acc)
+	s.setCachedModelCooldown(acc.DBID, cooldown)
+	if s.db != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		if err := s.db.SetModelCooldown(ctx, acc.DBID, cooldown.Model, cooldown.Reason, cooldown.ResetAt); err != nil {
+			log.Printf("[账号 %d] 持久化模型冷却失败 model=%s: %v", acc.DBID, cooldown.Model, err)
+		}
+	}
+	return cooldown
+}
+
+// ClearModelCooldownsByReason clears active model cooldowns with the given
+// reason whose remaining time exceeds keepWithin (0 clears all of them).
+func (s *Store) ClearModelCooldownsByReason(reason string, keepWithin time.Duration) int {
+	if s == nil {
+		return 0
+	}
+	cleared := 0
+	now := time.Now()
+	for _, acc := range s.accountSnapshotAccounts() {
+		if acc == nil {
+			continue
+		}
+		for _, cooldown := range acc.ActiveModelCooldowns() {
+			if cooldown.Reason != reason || (keepWithin > 0 && cooldown.ResetAt.Sub(now) <= keepWithin) {
+				continue
+			}
+			s.ClearModelCooldown(acc, cooldown.Model)
+			cleared++
+		}
+	}
+	return cleared
+}
+
+// UnsupportedModelPoolSummary reports whether dispatchable accounts are being
+// skipped for model because each recently answered the unsupported-model 400,
+// so callers can surface that instead of a bare "no available account".
+type UnsupportedModelPoolSummary struct {
+	Found   bool
+	ResetAt time.Time // earliest recovery among those accounts
+}
+
+func (s *Store) UnsupportedModelCandidateSummary(apiKeyID int64, exclude map[int64]bool, model string, policy DispatchPolicy) UnsupportedModelPoolSummary {
+	var summary UnsupportedModelPoolSummary
+	key := normalizeModelCooldownKey(model)
+	if s == nil || key == "" {
+		return summary
+	}
+	now := time.Now()
+	for _, acc := range s.accountSnapshotAccounts() {
+		if acc == nil || (exclude != nil && exclude[acc.DBID]) || acc.IsRelayStyle() {
+			continue
+		}
+		if !acc.dispatchableForPolicy(policy) || !s.accountAllowedForAPIKey(acc, apiKeyID) {
+			continue
+		}
+		acc.mu.RLock()
+		cooldown, ok := acc.ModelCooldowns[key]
+		acc.mu.RUnlock()
+		if !ok || cooldown.Reason != ModelCooldownReasonUnsupported || !cooldown.ResetAt.After(now) {
+			continue
+		}
+		summary.Found = true
+		if summary.ResetAt.IsZero() || cooldown.ResetAt.Before(summary.ResetAt) {
+			summary.ResetAt = cooldown.ResetAt
+		}
+	}
+	return summary
 }
 
 type ModelCooldownPolicy struct {

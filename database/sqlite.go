@@ -397,7 +397,8 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 					relay_model_cooldown_backoff_enabled INTEGER NOT NULL DEFAULT 0,
 					oauth_model_cooldown_mode TEXT NOT NULL DEFAULT 'adaptive',
 					oauth_model_cooldown_seconds INTEGER NOT NULL DEFAULT 300,
-					oauth_model_cooldown_backoff_enabled INTEGER NOT NULL DEFAULT 1
+					oauth_model_cooldown_backoff_enabled INTEGER NOT NULL DEFAULT 1,
+					oauth_unsupported_model_cooldown_seconds INTEGER NOT NULL DEFAULT 1800
 				);`,
 		modelCapabilitiesSchema,
 		daybreakSchema,
@@ -724,6 +725,7 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 		{"system_settings", "oauth_model_cooldown_mode", "TEXT NOT NULL DEFAULT 'adaptive'"},
 		{"system_settings", "oauth_model_cooldown_seconds", "INTEGER NOT NULL DEFAULT 300"},
 		{"system_settings", "oauth_model_cooldown_backoff_enabled", "INTEGER NOT NULL DEFAULT 1"},
+		{"system_settings", "oauth_unsupported_model_cooldown_seconds", "INTEGER NOT NULL DEFAULT 1800"},
 		{"system_settings", "max_retries", "INTEGER DEFAULT 2"},
 		{"system_settings", "max_rate_limit_retries", "INTEGER DEFAULT 1"},
 		{"system_settings", "allow_remote_migration", "INTEGER DEFAULT 0"},

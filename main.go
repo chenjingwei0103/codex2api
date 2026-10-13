@@ -206,6 +206,8 @@ func main() {
 	settings.OAuthModelCooldownMode = modelCooldownSettings.OAuthMode
 	settings.OAuthModelCooldownSeconds = modelCooldownSettings.OAuthSeconds
 	settings.OAuthModelCooldownBackoffEnabled = modelCooldownSettings.OAuthBackoffEnabled
+	settings.OAuthUnsupportedModelCooldownDisabled = modelCooldownSettings.OAuthUnsupportedDisabled
+	settings.OAuthUnsupportedModelCooldownSeconds = modelCooldownSettings.OAuthUnsupportedSeconds
 	if envPolicy := strings.TrimSpace(os.Getenv("CODEX_BILLING_TIER_POLICY")); envPolicy != "" {
 		settings.BillingTierPolicy = proxy.NormalizeBillingTierPolicy(envPolicy)
 	}
@@ -779,6 +781,10 @@ func printSecurityBanner(db *database.DB, cfg *config.Config, settings *database
 		log.Println("⚠ 尚未配置 ADMIN_SECRET（环境变量与数据库均为空）。")
 		log.Printf("  请使用浏览器访问管理台 http://%s:%d/admin/ 完成首次初始化，", bannerDisplayHost(bind), cfg.Port)
 		log.Println("  设置一个强随机的管理密钥；该密钥也将作为登录密钥。")
+		log.Println("  初始化页面需要填写下面的一次性令牌，以证明操作者能读到本服务日志：")
+		if _, err := admin.EnsureBootstrapToken(); err != nil {
+			log.Printf("  生成初始化令牌失败: %v", err)
+		}
 		log.Println("  在初始化完成之前，所有 /api/admin/* 接口（除初始化端点外）均返回 503。")
 	case envSecret != "":
 		log.Println("✓ ADMIN_SECRET 来源：环境变量 (.env)")

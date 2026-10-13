@@ -95,6 +95,13 @@ func (h *Handler) GetPublicAPIKeyUsageSummary(c *gin.Context) {
 		writeInternalError(c, err)
 		return
 	}
+	// 停用是管理员吊销凭据，与代理链路一致直接拒绝；过期/额度用尽仍可读，
+	// 让持有者看到状态与历史用量，明白调用为何失败。
+	if !row.Enabled {
+		security.SecurityAuditLog("KEY_USAGE_AUTH_FAILED_DISABLED_KEY", "ip="+security.SanitizeLog(c.ClientIP())+" key="+security.MaskAPIKey(key))
+		writeError(c, http.StatusUnauthorized, "API Key 已停用")
+		return
+	}
 
 	report, err := h.db.GetAPIKeySelfUsageReportFiltered(ctx, row.ID, rangeStart, rangeEnd, logPage, logPageSize, logFilter)
 	if err != nil {

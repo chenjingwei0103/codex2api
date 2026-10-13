@@ -42,6 +42,7 @@ interface SetupCheck {
 
 const MIN_SECRET_LEN = 8
 const MAX_SECRET_LEN = 256
+const BOOTSTRAP_TOKEN_LOG_COMMAND = 'docker compose logs codex2api | grep "bootstrap token"'
 const SETUP_SERVICE_URL_KEY = 'codex2api:first_setup_service_url'
 const SETUP_REVIEW_DONE_KEY = 'codex2api:first_setup_review_done_v1'
 
@@ -58,6 +59,8 @@ const COPY = {
     secretTitle: '管理密钥',
     configuredSecret: '已通过当前管理密钥登录',
     bootstrapHint: `至少 ${MIN_SECRET_LEN} 位，保存后用于登录后台和调用 /api/admin/*。`,
+    tokenLabel: '初始化令牌',
+    tokenHint: '服务启动时打印在日志中，用于确认操作者是部署者本人；重启服务会生成新令牌。Docker 部署可执行：',
     secretLabel: '管理密钥',
     confirmLabel: '再次输入确认',
     dataTitle: '数据目录',
@@ -90,6 +93,7 @@ const COPY = {
     monitoringOff: '已关闭请求日志',
     monitoringErrors: '仅记录错误请求',
     unknown: '未检测到',
+    errTokenEmpty: '请填写服务日志中的初始化令牌',
     errEmpty: '管理密钥不能为空',
     errTooShort: `管理密钥至少 ${MIN_SECRET_LEN} 位`,
     errTooLong: `管理密钥不可超过 ${MAX_SECRET_LEN} 个字符`,
@@ -113,6 +117,8 @@ const COPY = {
     secretTitle: 'Admin secret',
     configuredSecret: 'Signed in with the current admin secret',
     bootstrapHint: `At least ${MIN_SECRET_LEN} characters. Used for dashboard login and /api/admin/* calls.`,
+    tokenLabel: 'Bootstrap token',
+    tokenHint: 'Printed in the service log at startup to prove you operate this deployment; restarting the service issues a new one. For Docker deployments run:',
     secretLabel: 'Admin secret',
     confirmLabel: 'Confirm secret',
     dataTitle: 'Data paths',
@@ -145,6 +151,7 @@ const COPY = {
     monitoringOff: 'Request logging is disabled',
     monitoringErrors: 'Only failed requests are recorded',
     unknown: 'Not detected',
+    errTokenEmpty: 'Enter the bootstrap token from the service log',
     errEmpty: 'Admin secret cannot be empty',
     errTooShort: `Admin secret must be at least ${MIN_SECRET_LEN} characters`,
     errTooLong: `Admin secret must not exceed ${MAX_SECRET_LEN} characters`,
@@ -320,6 +327,7 @@ export default function AuthGate({ children }: PropsWithChildren) {
   const [bootstrapSetup, setBootstrapSetup] = useState<BootstrapSetupInfo | null>(null)
   const [bsServiceUrl, setBsServiceUrl] = useState(initialServiceURL)
   const [bsMonitoringEnabled, setBsMonitoringEnabled] = useState(true)
+  const [bsToken, setBsToken] = useState('')
   const [bsSecret, setBsSecret] = useState('')
   const [bsConfirm, setBsConfirm] = useState('')
   const [bsError, setBsError] = useState('')
@@ -543,9 +551,14 @@ export default function AuthGate({ children }: PropsWithChildren) {
 
   const handleBootstrap = async () => {
     setBsError('')
+    const token = bsToken.trim()
     const secret = bsSecret.trim()
     const confirm = bsConfirm.trim()
     const serviceUrl = cleanServiceURL(bsServiceUrl || bootstrapSetup?.service_url || browserOrigin())
+    if (!token) {
+      setBsError(copy.errTokenEmpty)
+      return
+    }
     if (!secret) {
       setBsError(copy.errEmpty)
       return
@@ -568,7 +581,7 @@ export default function AuthGate({ children }: PropsWithChildren) {
       const res = await fetch('/api/admin/bootstrap', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ admin_secret: secret }),
+        body: JSON.stringify({ admin_secret: secret, bootstrap_token: token }),
       })
       if (!res.ok) {
         const body = (await res.json().catch(() => ({}))) as { error?: string }
@@ -580,6 +593,7 @@ export default function AuthGate({ children }: PropsWithChildren) {
         window.localStorage.setItem(SETUP_SERVICE_URL_KEY, serviceUrl)
       }
       setBsServiceUrl(serviceUrl)
+      setBsToken('')
       setBsSecret('')
       setBsConfirm('')
       await buildSetupChecks(serviceUrl, bsMonitoringEnabled)
@@ -673,13 +687,29 @@ export default function AuthGate({ children }: PropsWithChildren) {
               <p className="text-xs leading-relaxed text-muted-foreground">{copy.bootstrapHint}</p>
               <div className="mt-4 space-y-4">
                 <div>
+                  <label className="mb-2 block text-sm font-semibold text-foreground">{copy.tokenLabel}</label>
+                  <input
+                    type="text"
+                    value={bsToken}
+                    onChange={(e) => { setBsToken(e.target.value); setBsError('') }}
+                    autoComplete="off"
+                    spellCheck={false}
+                    className="h-10 w-full rounded-md border border-input bg-background px-3.5 font-mono text-[14px] outline-none transition-all focus:border-primary/40 focus:ring-2 focus:ring-primary/10"
+                    autoFocus
+                  />
+                  <p className="mt-2 text-xs leading-relaxed text-muted-foreground">{copy.tokenHint}</p>
+                  <code className="mt-1.5 block break-all rounded-md bg-muted/40 px-2.5 py-1.5 font-mono text-[12px] text-foreground">
+                    {BOOTSTRAP_TOKEN_LOG_COMMAND}
+                  </code>
+                </div>
+
+                <div>
                   <label className="mb-2 block text-sm font-semibold text-foreground">{copy.secretLabel}</label>
                   <input
                     type="password"
                     value={bsSecret}
                     onChange={(e) => { setBsSecret(e.target.value); setBsError('') }}
                     className="h-10 w-full rounded-md border border-input bg-background px-3.5 text-[15px] outline-none transition-all focus:border-primary/40 focus:ring-2 focus:ring-primary/10"
-                    autoFocus
                   />
                 </div>
 

@@ -5327,6 +5327,8 @@
     "modelCooldownSecondsDesc": "模型冷却基础秒数，范围 1–1800 秒。",
     "modelCooldownBackoff": "指数退避",
     "modelCooldownBackoffDesc": "仅自适应模式生效；重复 429 会逐步延长，最长 30 分钟。",
+    "unsupportedModelCooldownSeconds": "不支持模型冷却",
+    "unsupportedModelCooldownSecondsDesc": "上游返回「model is not supported when using Codex with a ChatGPT account」时，该账号在此时长内不再调度这个模型，不影响其他模型和账号健康度。0 表示关闭（同一请求内仍会换号重试）；调小或关闭时会自动清除超出新时长的已有冷却。混用免费/付费账号时，建议在账号详情配置支持模型白名单。",
     "claudeSettingsTitle": "ClaudeCode 全局配置",
     "claudeSettingsDesc": "统一控制 Claude 上游的 User-Agent 与身份头策略、默认时区和并发窗口;个体账号可单独覆盖。",
     "claudeClientPlatform": "客户端平台",

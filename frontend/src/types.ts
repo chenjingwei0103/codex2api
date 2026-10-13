@@ -2254,6 +2254,7 @@ export interface SystemSettings {
   oauth_model_cooldown_mode: ModelCooldownMode
   oauth_model_cooldown_seconds: number
   oauth_model_cooldown_backoff_enabled: boolean
+  oauth_unsupported_model_cooldown_seconds: number
   expired_cleaned?: number
   model_mapping: string
   codex_model_mapping: string

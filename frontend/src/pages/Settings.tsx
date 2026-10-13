@@ -2680,6 +2680,7 @@ export default function Settings() {
     oauth_model_cooldown_mode: 'adaptive',
     oauth_model_cooldown_seconds: 300,
     oauth_model_cooldown_backoff_enabled: true,
+    oauth_unsupported_model_cooldown_seconds: 1800,
     model_mapping: '{}',
     codex_model_mapping: '{}',
     payload_rules: '{}',
@@ -5979,6 +5980,19 @@ export default function Settings() {
                         checked={settingsForm.oauth_model_cooldown_backoff_enabled}
                         disabled={settingsForm.oauth_model_cooldown_mode !== 'adaptive'}
                         onCheckedChange={(checked) => autoSaveBooleanField('oauth_model_cooldown_backoff_enabled', checked)}
+                      />
+                    </SettingField>
+                    <SettingField
+                      label={t('settings.unsupportedModelCooldownSeconds')}
+                      description={t('settings.unsupportedModelCooldownSecondsDesc')}
+                      suffix={t('settings.unit.sec')}
+                    >
+                      <DraftNumberInput
+                        min={0}
+                        max={1800}
+                        value={settingsForm.oauth_unsupported_model_cooldown_seconds}
+                        onValueChange={(value) => setSettingsForm(f => ({ ...f, oauth_unsupported_model_cooldown_seconds: value }))}
+                        onValueCommit={(value) => void autoSaveSettingsPatch({ oauth_unsupported_model_cooldown_seconds: value })}
                       />
                     </SettingField>
                   </div>

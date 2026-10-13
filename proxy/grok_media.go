@@ -639,7 +639,7 @@ func (h *Handler) forwardGrokImagesRequest(c *gin.Context, inboundEndpoint, imag
 				h.store.Release(account)
 				return
 			}
-			if kind := classifyHTTPFailure(resp.StatusCode); kind != "" {
+			if kind := classifyHTTPFailure(resp.StatusCode, errBody); kind != "" {
 				h.store.ReportRequestFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
 			}
 			h.store.Release(account)
@@ -1017,7 +1017,7 @@ func (h *Handler) grokVideoCreate(c *gin.Context, operation string) {
 				h.store.Release(account)
 				return
 			}
-			if kind := classifyHTTPFailure(resp.StatusCode); kind != "" {
+			if kind := classifyHTTPFailure(resp.StatusCode, errBody); kind != "" {
 				h.store.ReportRequestFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
 			}
 			h.store.Release(account)

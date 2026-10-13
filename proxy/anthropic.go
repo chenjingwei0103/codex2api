@@ -126,11 +126,14 @@ type anthropicImageSource struct {
 }
 
 type anthropicTool struct {
-	Type         string                 `json:"type,omitempty"`
-	Name         string                 `json:"name"`
-	Description  string                 `json:"description,omitempty"`
-	InputSchema  json.RawMessage        `json:"input_schema"`
-	CacheControl *anthropicCacheControl `json:"cache_control,omitempty"`
+	Type           string                 `json:"type,omitempty"`
+	Name           string                 `json:"name"`
+	Description    string                 `json:"description,omitempty"`
+	InputSchema    json.RawMessage        `json:"input_schema"`
+	AllowedDomains []string               `json:"allowed_domains,omitempty"`
+	BlockedDomains []string               `json:"blocked_domains,omitempty"`
+	UserLocation   map[string]any         `json:"user_location,omitempty"`
+	CacheControl   *anthropicCacheControl `json:"cache_control,omitempty"`
 }
 
 // ==================== Anthropic 响应类型 ====================
@@ -440,7 +443,7 @@ func translateAnthropicToResponses(rawJSON []byte, modelMappingJSON string, supp
 
 	// tool_choice
 	if len(req.ToolChoice) > 0 {
-		if tc := convertAnthropicToolChoice(req.ToolChoice); tc != nil {
+		if tc := convertAnthropicToolChoiceForTools(req.ToolChoice, req.Tools); tc != nil {
 			out["tool_choice"] = tc
 		}
 	}
@@ -477,20 +480,16 @@ func copyAnthropicResponsesControls(out map[string]any, req anthropicRequest) er
 	}
 
 	if len(req.ToolChoice) > 0 && strings.TrimSpace(string(req.ToolChoice)) != "null" {
-		choice := convertAnthropicToolChoice(req.ToolChoice)
+		choice := convertAnthropicToolChoiceForTools(req.ToolChoice, req.Tools)
 		if choice == nil {
 			return fmt.Errorf("Messages tool_choice cannot be represented by Responses")
 		}
+		// convertAnthropicToolChoice 已返回 Responses 的扁平形态；字符串形态
+		// （auto/required/none）直接透传。这里只需校验 function 选择确实带了 name。
 		if choiceMap, ok := choice.(map[string]any); ok {
-			function, _ := choiceMap["function"].(map[string]any)
-			name := strings.TrimSpace(firstNonEmptyAnyString(choiceMap["name"]))
-			if name == "" {
-				name = strings.TrimSpace(firstNonEmptyAnyString(function["name"]))
-			}
-			if name == "" {
+			if strings.TrimSpace(firstNonEmptyAnyString(choiceMap["name"])) == "" {
 				return fmt.Errorf("Messages tool_choice type tool requires name")
 			}
-			choice = map[string]any{"type": "function", "name": name}
 		}
 		out["tool_choice"] = choice
 	}
@@ -964,10 +963,82 @@ func convertAnthropicToolsForGrok(tools []anthropicTool, orderKey string) []any 
 	return stabilizeGrokToolOrder(orderKey, convertAnthropicTools(tools))
 }
 
+// anthropicServerToolTypes 把 Anthropic 的「服务端工具」类型映射到 Codex 上游的
+// hosted tool 类型。这类工具没有 input_schema，由上游在推理时自行执行，客户端
+// 从不收到 tool_use 回调（Anthropic 用 server_tool_use / web_search_tool_result
+// 表达同一语义）。
+var anthropicServerToolTypes = map[string]string{
+	"web_search":                    "web_search",
+	"web_search_20250305":           "web_search",
+	"web_search_20260209":           "web_search",
+	"web_search_20260318":           "web_search",
+	"web_search_preview":            "web_search",
+	"web_search_preview_2025_03_11": "web_search",
+}
+
+// anthropicHostedToolType 判断该工具是否为服务端工具，返回对应的 hosted 类型。
+// 客户端有两种声明形态，都要认：
+//   - 服务端形态：{"type":"web_search_20250305", "name":"web_search"}
+//   - name-only 形态：{"name":"web_search"}（部分 Anthropic 客户端会这样摊平）
+//
+// name-only 只有在没有 input_schema 时才按服务端工具处理；如果调用方显式声明了
+// input_schema，说明这是用户自定义的同名客户端 function，必须保留 function 语义。
+func anthropicHostedToolType(t anthropicTool) (string, bool) {
+	if hosted, ok := anthropicServerToolTypes[strings.TrimSpace(t.Type)]; ok {
+		return hosted, true
+	}
+	if strings.TrimSpace(t.Type) == "" && strings.TrimSpace(t.Name) == "web_search" && !anthropicToolHasInputSchema(t) {
+		return "web_search", true
+	}
+	return "", false
+}
+
+func anthropicToolHasInputSchema(t anthropicTool) bool {
+	if len(t.InputSchema) == 0 {
+		return false
+	}
+	raw := strings.TrimSpace(string(t.InputSchema))
+	return raw != "" && raw != "null"
+}
+
+func anthropicHostedTool(t anthropicTool, hosted string) map[string]any {
+	out := map[string]any{"type": hosted}
+	if len(t.UserLocation) > 0 {
+		out["user_location"] = t.UserLocation
+	}
+	filters := map[string]any{}
+	if len(t.AllowedDomains) > 0 {
+		filters["allowed_domains"] = append([]string(nil), t.AllowedDomains...)
+	}
+	if len(t.BlockedDomains) > 0 {
+		filters["blocked_domains"] = append([]string(nil), t.BlockedDomains...)
+	}
+	if len(filters) > 0 {
+		out["filters"] = filters
+	}
+	return out
+}
+
+func anthropicServerToolUseID(item gjson.Result) string {
+	id := strings.TrimSpace(item.Get("id").String())
+	if id == "" {
+		id = strings.TrimSpace(item.Get("call_id").String())
+	}
+	if id == "" {
+		id = uuid.New().String()[:24]
+	}
+	return "srvtoolu_" + id
+}
+
 // convertAnthropicTools 将 Anthropic 工具格式转为 Codex 格式
 func convertAnthropicTools(tools []anthropicTool) []any {
 	result := make([]any, 0, len(tools))
 	for _, t := range tools {
+		// 服务端工具（联网检索等）转成 hosted tool，保留「上游代跑」语义。
+		if hosted, ok := anthropicHostedToolType(t); ok {
+			result = append(result, anthropicHostedTool(t, hosted))
+			continue
+		}
 		item := map[string]any{
 			"type": "function",
 			"name": t.Name,
@@ -983,6 +1054,15 @@ func convertAnthropicTools(tools []anthropicTool) []any {
 			if json.Unmarshal(t.InputSchema, &params) == nil {
 				sanitizeSchemaForUpstream(params)
 				item["parameters"] = params
+			}
+		}
+		// 上游要求 function 工具必须带 parameters，缺失会 400
+		// "code 11129 invalid function call parameters"。Anthropic 客户端有时会发
+		// 不带 input_schema 的普通工具（例如空参数工具），这里补一个空 schema 兜底。
+		if _, ok := item["parameters"]; !ok {
+			item["parameters"] = map[string]any{
+				"type":       "object",
+				"properties": map[string]any{},
 			}
 		}
 		result = append(result, item)
@@ -1015,17 +1095,64 @@ func convertAnthropicToolChoice(raw json.RawMessage) any {
 		return "none"
 	case "tool":
 		if tc.Name != "" {
+			// Responses 的 function tool_choice 是扁平形态
+			// {type:"function", name:"..."}；写成 Chat Completions 的嵌套形态
+			// {type:"function", function:{name:...}} 会被上游以
+			// "Missing required parameter: 'tool_choice.name'" 拒绝。
 			return map[string]any{
 				"type": "function",
-				"function": map[string]any{
-					"name": tc.Name,
-				},
+				"name": tc.Name,
 			}
 		}
 		return "auto"
 	default:
 		return nil
 	}
+}
+
+func convertAnthropicToolChoiceForTools(raw json.RawMessage, tools []anthropicTool) any {
+	if len(raw) == 0 || string(raw) == "null" {
+		return nil
+	}
+	var tc struct {
+		Type string `json:"type"`
+		Name string `json:"name,omitempty"`
+	}
+	if json.Unmarshal(raw, &tc) == nil && tc.Type == "tool" && tc.Name != "" && anthropicToolsContainHostedName(tools, tc.Name) {
+		// Anthropic 的 {"type":"tool","name":"web_search"} 要求「必须调用 web_search」。
+		// Responses 的字符串 "required" 只保证「调用某个工具」，工具表里同时存在普通
+		// function 时模型可能改选它（实测确实会选中别的 function），违反命名选择语义；
+		// 命名 function 形态又会因 web_search 是 hosted 而非 function 而 400
+		// ("Tool choice 'web_search' not found in 'tools' parameter")。
+		// allowed_tools + mode=required 把可选集合收敛到 web_search 本身。
+		return map[string]any{
+			"type": "allowed_tools",
+			"mode": "required",
+			"tools": []any{
+				map[string]any{"type": "web_search"},
+			},
+		}
+	}
+	return convertAnthropicToolChoice(raw)
+}
+
+func anthropicToolsContainHostedName(tools []anthropicTool, name string) bool {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return false
+	}
+	for _, tool := range tools {
+		if hosted, ok := anthropicHostedToolType(tool); ok && hosted == "web_search" {
+			toolName := strings.TrimSpace(tool.Name)
+			if toolName == "" {
+				toolName = "web_search"
+			}
+			if toolName == name {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // ==================== 响应翻译: Codex SSE → Anthropic ====================
@@ -1211,6 +1338,20 @@ func (t *anthropicStreamTranslator) handleOutputItemAdded(data []byte) []anthrop
 			events = append(events, t.contentBlockDelta(anthropicDelta{Type: "input_json_delta", PartialJSON: `{"input":"`})...)
 		}
 
+	case "web_search_call":
+		// hosted 检索：上游代跑，不回调客户端。开一个 server_tool_use 块，
+		// 收尾（output_item.done）时补 web_search_tool_result 并关块。
+		events = append(events, t.closeCurrentBlock()...)
+		callID := anthropicServerToolUseID(gjson.GetBytes(data, "item"))
+		t.currentBlockType = "server_tool_use"
+		t.currentToolUseID = callID
+		t.currentToolUseName = "web_search"
+		events = append(events, t.startContentBlock(anthropicContentBlock{
+			Type: "server_tool_use",
+			ID:   callID,
+			Name: "web_search",
+		})...)
+
 	case "message":
 		// text block 延迟到第一个 delta 时打开
 	}
@@ -1311,6 +1452,27 @@ func (t *anthropicStreamTranslator) handleContentDone() []anthropicStreamEvent {
 // reasoning item 携带 encrypted_content 时先发 signature_delta 再关块：
 // signature 即密文本身，输入侧据此重建 reasoning item 回传上游。
 func (t *anthropicStreamTranslator) handleOutputItemDone(data []byte) []anthropicStreamEvent {
+	// hosted 检索收尾：补 web_search_tool_result 块，再关掉 server_tool_use。
+	if t.contentBlockOpen && t.currentBlockType == "server_tool_use" &&
+		gjson.GetBytes(data, "item.type").String() == "web_search_call" {
+		var events []anthropicStreamEvent
+		for _, block := range anthropicServerToolBlocks(gjson.GetBytes(data, "item")) {
+			switch block.Type {
+			case "server_tool_use":
+				if len(block.Input) > 0 && json.Valid(block.Input) && string(block.Input) != "{}" {
+					events = append(events, t.contentBlockDelta(anthropicDelta{Type: "input_json_delta", PartialJSON: string(block.Input)})...)
+				}
+				events = append(events, t.closeCurrentBlock()...)
+			case "web_search_tool_result":
+				events = append(events, t.startContentBlock(block)...)
+				events = append(events, t.closeCurrentBlock()...)
+			}
+		}
+		if len(events) == 0 {
+			events = append(events, t.closeCurrentBlock()...)
+		}
+		return events
+	}
 	if t.contentBlockOpen && t.currentToolCustom && t.currentBlockType == "tool_use" && gjson.GetBytes(data, "item.type").String() == "custom_tool_call" {
 		events := t.finishCustomToolInput(gjson.GetBytes(data, "item.input"))
 		if t.toolInputError != nil {
@@ -1544,12 +1706,156 @@ func compactAnthropicContent(content []anthropicContentBlock) []anthropicContent
 			} else if block.Input == nil || !json.Valid(block.Input) {
 				block.Input = json.RawMessage("{}")
 			}
+		case "server_tool_use":
+			if block.Input == nil || !json.Valid(block.Input) {
+				block.Input = json.RawMessage("{}")
+			}
+		case "web_search_tool_result":
+			if block.Content == nil || !json.Valid(block.Content) {
+				block.Content = json.RawMessage("[]")
+			}
 		default:
 			continue
 		}
 		out = append(out, block)
 	}
 	return out
+}
+
+// anthropicServerToolBlocks 把一个 Codex hosted tool item（目前只有
+// web_search_call）转成 Anthropic 的服务端工具块对：
+// server_tool_use（客户端据此展示「正在检索」）+ web_search_tool_result。
+//
+// 状态映射遵循 Anthropic 的服务端工具约定：
+//   - completed：正常结果（无命中时 content 为空数组，不是错误）
+//   - failed / incomplete：检索本身失败，content 为单个
+//     web_search_tool_result_error 对象，仍要配对下发，否则 server_tool_use
+//     会悬空，客户端拿不到终态
+//   - 其它（in_progress / searching）：仍在进行，不下发
+//
+// Codex 默认不回传完整 results（正文和链接通常在随后的 message 块承载），
+// 因此这里只转发上游明确给出的 results，不从 action.sources 或正文里伪造结果。
+func anthropicServerToolBlocks(item gjson.Result) []anthropicContentBlock {
+	status := strings.TrimSpace(item.Get("status").String())
+	switch status {
+	case "completed":
+	case "failed", "incomplete":
+		return anthropicServerToolErrorBlocks(item)
+	default:
+		// in_progress / searching / 未知状态：检索还没终态，等 done 事件再发。
+		return nil
+	}
+	callID := anthropicServerToolUseID(item)
+
+	// 查询词：新版回 action.queries 数组，旧版回单个 action.query。
+	var queries []string
+	item.Get("action.queries").ForEach(func(_, q gjson.Result) bool {
+		if s := strings.TrimSpace(q.String()); s != "" {
+			queries = append(queries, s)
+		}
+		return true
+	})
+	if len(queries) == 0 {
+		if q := strings.TrimSpace(item.Get("action.query").String()); q != "" {
+			queries = append(queries, q)
+		}
+	}
+
+	results := make([]any, 0)
+	item.Get("results").ForEach(func(_, r gjson.Result) bool {
+		entry := map[string]any{"type": "web_search_result"}
+		for _, key := range []string{"url", "title", "page_age"} {
+			if v := r.Get(key).String(); v != "" {
+				entry[key] = v
+			}
+		}
+		if enc := r.Get("encrypted_content").String(); enc != "" {
+			entry["encrypted_content"] = enc
+		}
+		results = append(results, entry)
+		return true
+	})
+	resultJSON, err := json.Marshal(results)
+	if err != nil {
+		resultJSON = []byte("[]")
+	}
+
+	return []anthropicContentBlock{
+		anthropicServerToolUseBlock(item, callID, queries),
+		{
+			Type:      "web_search_tool_result",
+			ToolUseID: callID,
+			Content:   json.RawMessage(resultJSON),
+		},
+	}
+}
+
+// anthropicServerToolErrorBlocks 为 failed / incomplete 的检索下发配对块：
+// server_tool_use + content 为单个 web_search_tool_result_error 的结果块。
+// Anthropic 把工具级失败表达成 200 响应内的错误结果对象，而不是 HTTP 错误。
+func anthropicServerToolErrorBlocks(item gjson.Result) []anthropicContentBlock {
+	callID := anthropicServerToolUseID(item)
+
+	var queries []string
+	item.Get("action.queries").ForEach(func(_, q gjson.Result) bool {
+		if s := strings.TrimSpace(q.String()); s != "" {
+			queries = append(queries, s)
+		}
+		return true
+	})
+	if len(queries) == 0 {
+		if q := strings.TrimSpace(item.Get("action.query").String()); q != "" {
+			queries = append(queries, q)
+		}
+	}
+
+	// 只有 Anthropic 文档列出的错误码才原样透传；上游给不出已知错误码时用
+	// unavailable，而不是把上游内部原因当作客户端可见错误码编造出来。
+	errorCode := strings.TrimSpace(item.Get("error.code").String())
+	if !anthropicWebSearchErrorCodes[errorCode] {
+		errorCode = "unavailable"
+	}
+	contentJSON, err := json.Marshal(map[string]any{
+		"type":       "web_search_tool_result_error",
+		"error_code": errorCode,
+	})
+	if err != nil {
+		contentJSON = []byte(`{"type":"web_search_tool_result_error","error_code":"unavailable"}`)
+	}
+
+	return []anthropicContentBlock{
+		anthropicServerToolUseBlock(item, callID, queries),
+		{
+			Type:      "web_search_tool_result",
+			ToolUseID: callID,
+			Content:   json.RawMessage(contentJSON),
+		},
+	}
+}
+
+// anthropicWebSearchErrorCodes 是 Anthropic 文档列出的服务端检索错误码。
+var anthropicWebSearchErrorCodes = map[string]bool{
+	"too_many_requests":  true,
+	"invalid_tool_input": true,
+	"max_uses_exceeded":  true,
+	"query_too_long":     true,
+	"request_too_large":  true,
+	"unavailable":        true,
+}
+
+// anthropicServerToolUseBlock 构造配对的 server_tool_use 块。
+// query 为空时仍下发空对象，保持与结果块的 id 配对。
+func anthropicServerToolUseBlock(item gjson.Result, callID string, queries []string) anthropicContentBlock {
+	inputJSON, err := json.Marshal(map[string]any{"query": strings.Join(queries, " ")})
+	if err != nil {
+		inputJSON = []byte("{}")
+	}
+	return anthropicContentBlock{
+		Type:  "server_tool_use",
+		ID:    callID,
+		Name:  "web_search",
+		Input: json.RawMessage(inputJSON),
+	}
 }
 
 // buildAnthropicResponseFromCompleted 从 response.completed 事件构建完整的 Anthropic 响应
@@ -1611,6 +1917,14 @@ func buildAnthropicResponseFromCompleted(completedData []byte, model string) *an
 				}
 				return true
 			})
+
+		case "web_search_call":
+			// hosted 检索：上游已代跑完成，模型不会回调客户端。转成 Anthropic 的
+			// 服务端工具对（server_tool_use + web_search_tool_result），让客户端的
+			// 检索展示与引用计数正常工作。缺失该分支时结果会被静默丢弃。
+			blocks := anthropicServerToolBlocks(item)
+			content = append(content, blocks...)
+			lastBlockIsToolUse = false
 
 		case "function_call", "custom_tool_call":
 			// function_call/custom_tool_call → tool_use block

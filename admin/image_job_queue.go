@@ -3,8 +3,10 @@ package admin
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"image"
 	"io"
@@ -27,11 +29,40 @@ import (
 const queueInputPrefix = "queue-input:"
 const queueInputBudget = 32 << 20
 const queueLeaseDuration = 2 * time.Minute
+const queueHeadScanLimit = 64
+const queueStaleScanLimit = 32
+const defaultMaxQueuedPerKey = 1000
+const defaultMaxQueueWait = 24 * time.Hour
 
 type imageJobQueue struct {
-	intake   chan struct{}
-	wg       sync.WaitGroup
-	pipeline bool
+	intake          chan struct{}
+	wg              sync.WaitGroup
+	pipeline        bool
+	maxQueuedPerKey int           // 0 disables the per-key backlog cap
+	maxQueueWait    time.Duration // 0 disables failing jobs that never started
+}
+
+func imageJobQueueLimits() (int, time.Duration, error) {
+	maxQueued := defaultMaxQueuedPerKey
+	if raw := strings.TrimSpace(os.Getenv("IMAGE_JOB_MAX_QUEUED_PER_KEY")); raw != "" {
+		n, err := strconv.Atoi(raw)
+		if err != nil || n < 0 {
+			return 0, 0, fmt.Errorf("IMAGE_JOB_MAX_QUEUED_PER_KEY must be a non-negative integer")
+		}
+		maxQueued = n
+	}
+	maxWait := defaultMaxQueueWait
+	if raw := strings.TrimSpace(os.Getenv("IMAGE_JOB_MAX_QUEUE_WAIT")); raw != "" {
+		d, err := time.ParseDuration(raw)
+		if raw == "0" {
+			d, err = 0, nil
+		}
+		if err != nil || d < 0 || (d > 0 && d < time.Minute) {
+			return 0, 0, fmt.Errorf("IMAGE_JOB_MAX_QUEUE_WAIT must be 0 or a duration of at least 1m")
+		}
+		maxWait = d
+	}
+	return maxQueued, maxWait, nil
 }
 
 // ImageJobWorkerCount reads the opt-in worker limit; zero preserves legacy admission.
@@ -66,15 +97,19 @@ func (h *Handler) StartImageJobQueue(ctx context.Context, workers int) error {
 			return fmt.Errorf("IMAGE_JOB_MEMORY_WORKERS must be 0..IMAGE_JOB_WORKERS")
 		}
 	}
+	maxQueued, maxWait, err := imageJobQueueLimits()
+	if err != nil {
+		return err
+	}
 	proxy.ConfigureImagePipeline(memoryWorkers)
-	h.imageQueue = &imageJobQueue{intake: make(chan struct{}, 2), pipeline: memoryWorkers > 0}
+	h.imageQueue = &imageJobQueue{intake: make(chan struct{}, 2), pipeline: memoryWorkers > 0, maxQueuedPerKey: maxQueued, maxQueueWait: maxWait}
 	log.Printf("[image-pipeline] configured inflight=%d memory_workers=%d", workers, memoryWorkers)
 	proxy.ConfigureImageExecutionLimit(workers)
 	for i := 0; i < workers; i++ {
 		h.imageQueue.wg.Add(1)
 		go func() { defer h.imageQueue.wg.Done(); h.imageQueueWorker(ctx) }()
 	}
-	log.Printf("[image-queue] started workers=%d input_budget_bytes=%d durable=true", workers, queueInputBudget)
+	log.Printf("[image-queue] started workers=%d input_budget_bytes=%d max_queued_per_key=%d max_queue_wait=%s durable=true", workers, queueInputBudget, maxQueued, maxWait)
 	return nil
 }
 
@@ -214,6 +249,18 @@ func loadQueueInputs(ctx context.Context, req *imageGenerationJobPayload) error 
 }
 
 func (h *Handler) persistQueuedImageJob(c *gin.Context, req imageGenerationJobPayload, key *database.APIKeyRow, status int, external bool) {
+	if h.imageQueue != nil && h.imageQueue.maxQueuedPerKey > 0 && key != nil && key.ID > 0 {
+		queued, err := h.db.CountQueuedImageJobsByKey(c.Request.Context(), key.ID)
+		if err != nil {
+			writeInternalError(c, err)
+			return
+		}
+		if queued >= h.imageQueue.maxQueuedPerKey {
+			c.Header("Retry-After", "30")
+			writeError(c, http.StatusTooManyRequests, fmt.Sprintf("too many queued image jobs for this API key (max %d)", h.imageQueue.maxQueuedPerKey))
+			return
+		}
+	}
 	if err := prepareQueueInputs(&req); err != nil {
 		writeError(c, http.StatusBadRequest, err.Error())
 		return
@@ -272,23 +319,82 @@ func (h *Handler) runNextQueuedImage(ctx context.Context) {
 		log.Printf("[image-queue] recovery failed: %v", err)
 		return
 	}
-	ids, err := h.db.QueuedImageJobIDs(ctx, 1)
+	h.failStaleQueuedImages(ctx)
+	heads, err := h.db.QueuedImageJobHeads(ctx, queueHeadScanLimit)
 	if err != nil {
 		log.Printf("[image-queue] scan failed: %v", err)
 		return
 	}
-	if len(ids) == 0 {
+	// Take the key slot before claiming: a key saturated by its own requests
+	// must leave its jobs queued instead of parking a worker on them.
+	for _, head := range heads {
+		key, err := h.db.GetAPIKeyByID(ctx, head.APIKeyID)
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+			log.Printf("[image-queue] key lookup failed job=%d: %v", head.ID, err)
+			continue
+		}
+		var release func()
+		if imageJobKeyUsable(key) {
+			var ok bool
+			if release, ok = h.imageProxy.TryAcquireImageJobKey(key); !ok {
+				continue
+			}
+		}
+		owner := uuid.NewString()
+		ok, err := h.db.ClaimImageJob(ctx, head.ID, owner, time.Now().Add(queueLeaseDuration))
+		if err != nil || !ok {
+			if release != nil {
+				release()
+			}
+			if err != nil {
+				log.Printf("[image-queue] claim failed job=%d: %v", head.ID, err)
+			}
+			continue
+		}
+		h.runClaimedImageJob(ctx, head.ID, owner, key, release)
 		return
 	}
-	id := ids[0]
-	owner := uuid.NewString()
-	ok, err := h.db.ClaimImageJob(ctx, id, owner, time.Now().Add(queueLeaseDuration))
+}
+
+func imageJobKeyUsable(key *database.APIKeyRow) bool {
+	return key != nil && key.Enabled && !(key.ExpiresAt.Valid && key.ExpiresAt.Time.Before(time.Now()))
+}
+
+// failStaleQueuedImages fails jobs that never started within maxQueueWait.
+// They never reached upstream, so retrying them is safe.
+func (h *Handler) failStaleQueuedImages(ctx context.Context) {
+	if h.imageQueue == nil || h.imageQueue.maxQueueWait <= 0 {
+		return
+	}
+	ids, err := h.db.StaleQueuedImageJobIDs(ctx, time.Now().Add(-h.imageQueue.maxQueueWait), queueStaleScanLimit)
 	if err != nil {
-		log.Printf("[image-queue] claim failed job=%d: %v", id, err)
+		log.Printf("[image-queue] stale scan failed: %v", err)
 		return
 	}
-	if !ok {
-		return
+	for _, id := range ids {
+		owner := uuid.NewString()
+		ok, err := h.db.ClaimImageJob(ctx, id, owner, time.Now().Add(queueLeaseDuration))
+		if err != nil || !ok {
+			continue
+		}
+		if job, err := h.db.GetImageGenerationJob(ctx, id); err == nil {
+			var req imageGenerationJobPayload
+			if json.Unmarshal([]byte(job.ParamsJSON), &req) == nil {
+				cleanupQueueInputs(req.InputImages)
+			}
+		}
+		statusCtx, stop := imageJobStatusContext()
+		_ = h.db.FinishLeasedImageJob(statusCtx, id, owner, database.ImageJobFailed, fmt.Sprintf("图片任务排队超过 %s 仍未开始，已取消；未请求上游，可直接重试", h.imageQueue.maxQueueWait), 0)
+		stop()
+		log.Printf("[image-queue] expired stale queued job=%d", id)
+	}
+}
+
+// release is the API-key slot taken before the claim; nil when the key is
+// unusable and the job is about to fail.
+func (h *Handler) runClaimedImageJob(ctx context.Context, id int64, owner string, key *database.APIKeyRow, release func()) {
+	if release != nil {
+		defer release()
 	}
 	jobCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -339,30 +445,14 @@ func (h *Handler) runNextQueuedImage(ctx context.Context) {
 	inputs := append([]string(nil), req.InputImages...)
 	defer cleanupQueueInputs(inputs)
 	req.External = true
-	key, err := h.db.GetAPIKeyByID(jobCtx, job.APIKeyID)
-	if err != nil {
+	if key == nil {
 		fail(fmt.Errorf("image job API key is unavailable"))
 		return
 	}
-	if key == nil || !key.Enabled || (key.ExpiresAt.Valid && key.ExpiresAt.Time.Before(time.Now())) {
+	if !imageJobKeyUsable(key) {
 		fail(fmt.Errorf("image job API key is disabled or deleted"))
 		return
 	}
-	var release func()
-	for {
-		var ok bool
-		release, ok = h.imageProxy.TryAcquireImageJobKey(key)
-		if ok {
-			break
-		}
-		select {
-		case <-jobCtx.Done():
-			fail(jobCtx.Err())
-			return
-		case <-time.After(time.Second):
-		}
-	}
-	defer release()
 	if h.imageQueue != nil && h.imageQueue.pipeline {
 		h.runPipelinedImageJob(jobCtx, id, owner, req, key)
 		return

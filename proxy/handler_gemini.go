@@ -289,7 +289,7 @@ func (h *Handler) handleGeminiCountTokens(c *gin.Context, model string, rawBody 
 				}
 			}
 
-			if kind := classifyHTTPFailure(resp.StatusCode); kind != "" && !antigravityNonPenalizingUpstreamFailure(account, resp.StatusCode, errBody) {
+			if kind := classifyHTTPFailure(resp.StatusCode, errBody); kind != "" && !antigravityNonPenalizingUpstreamFailure(account, resp.StatusCode, errBody) {
 				h.store.ReportRequestFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
 			}
 			h.store.Release(account)
@@ -565,7 +565,7 @@ func (h *Handler) handleGeminiGenerateContent(c *gin.Context, model string, rawB
 			}
 
 			antigravityRefreshFailed := resp.StatusCode == http.StatusUnauthorized && antigravityRefreshRetried[account.ID()]
-			if kind := classifyHTTPFailure(resp.StatusCode); kind != "" && !antigravityRefreshFailed && !antigravityNonPenalizingUpstreamFailure(account, resp.StatusCode, errBody) {
+			if kind := classifyHTTPFailure(resp.StatusCode, errBody); kind != "" && !antigravityRefreshFailed && !antigravityNonPenalizingUpstreamFailure(account, resp.StatusCode, errBody) {
 				h.store.ReportRequestFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
 			}
 			h.store.Release(account)

@@ -360,6 +360,7 @@ Redis 模式下，共享上下文只要没有超过重建上限，即使大于 L
 - **管理后台 Admin Secret**：
   - 如果 `.env` 中设置了 `ADMIN_SECRET`，则优先使用环境变量。
   - 如果未设置 `ADMIN_SECRET`，则回退到数据库中的 `AdminSecret`。
+  - 两者都为空时，访问 `/admin` 会进入首次初始化页面，需要填写服务日志里打印的一次性初始化令牌（`docker compose logs codex2api | grep "bootstrap token"`）；令牌仅当前进程有效，重启后重新生成，初始化成功后立即作废。
   - 鉴权生效时，首次访问 `/admin` 会弹出密码输入框；前端登录成功后通过 `X-Admin-Key` 请求头访问 `/api/admin/*`。
 
 ---

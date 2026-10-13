@@ -94,3 +94,59 @@ func TestImageJobQueueMigrationClaimAndRecovery(t *testing.T) {
 		t.Fatalf("restart lost queue: %v %v", ids, err)
 	}
 }
+
+func TestQueuedImageJobHeadsOnePerKeyAndStaleScan(t *testing.T) {
+	db, err := New("sqlite", filepath.Join(t.TempDir(), "heads.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	ctx := context.Background()
+	if err = db.InitImageJobQueue(ctx); err != nil {
+		t.Fatal(err)
+	}
+	insert := func(keyID int64) int64 {
+		id, err := db.InsertImageGenerationJob(ctx, ImageGenerationJobInput{Prompt: "p", APIKeyID: keyID})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return id
+	}
+	var flood []int64
+	for i := 0; i < 50; i++ {
+		flood = append(flood, insert(7))
+	}
+	other := insert(9)
+	noKey := insert(0)
+	if _, err = db.conn.ExecContext(ctx, `UPDATE image_generation_jobs SET api_key_id=NULL WHERE id=$1`, noKey); err != nil {
+		t.Fatal(err)
+	}
+	if ok, err := db.ClaimImageJob(ctx, flood[0], "owner", time.Now().Add(time.Minute)); err != nil || !ok {
+		t.Fatalf("claim: %v %v", ok, err)
+	}
+
+	heads, err := db.QueuedImageJobHeads(ctx, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []QueuedImageJobHead{{ID: flood[1], APIKeyID: 7}, {ID: other, APIKeyID: 9}}
+	if len(heads) != 2 || heads[0] != want[0] || heads[1] != want[1] {
+		t.Fatalf("heads=%v want %v", heads, want)
+	}
+	heads, err = db.QueuedImageJobHeads(ctx, 10)
+	if err != nil || len(heads) != 3 || heads[2] != (QueuedImageJobHead{ID: noKey, APIKeyID: 0}) {
+		t.Fatalf("heads=%v err=%v", heads, err)
+	}
+
+	if n, err := db.CountQueuedImageJobsByKey(ctx, 7); err != nil || n != 49 {
+		t.Fatalf("queued for key 7: %d %v", n, err)
+	}
+
+	if _, err = db.conn.ExecContext(ctx, `UPDATE image_generation_jobs SET created_at=$1 WHERE id IN ($2,$3)`, db.imageRetentionCutoff(time.Now().Add(-48*time.Hour)), flood[0], other); err != nil {
+		t.Fatal(err)
+	}
+	stale, err := db.StaleQueuedImageJobIDs(ctx, time.Now().Add(-24*time.Hour), 10)
+	if err != nil || len(stale) != 1 || stale[0] != other {
+		t.Fatalf("stale=%v err=%v (running jobs must be excluded)", stale, err)
+	}
+}

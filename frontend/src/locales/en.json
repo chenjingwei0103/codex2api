@@ -5328,6 +5328,8 @@
     "modelCooldownSecondsDesc": "Base model cooldown duration from 1 to 1800 seconds.",
     "modelCooldownBackoff": "Exponential backoff",
     "modelCooldownBackoffDesc": "Adaptive mode only. Repeated 429s extend the cooldown up to 30 minutes.",
+    "unsupportedModelCooldownSeconds": "Unsupported-model cooldown",
+    "unsupportedModelCooldownSecondsDesc": "When upstream answers \"model is not supported when using Codex with a ChatGPT account\", the account stops serving that model for this long. Other models and account health are unaffected. 0 disables it (the same request still fails over to other accounts); lowering or disabling it clears existing cooldowns longer than the new value. For mixed free/paid pools, prefer the per-account supported-model whitelist.",
     "claudeSettingsTitle": "ClaudeCode Global Config",
     "claudeSettingsDesc": "Controls the default Claude User-Agent and identity-header policy, timezone, and session window; accounts may override it.",
     "claudeClientPlatform": "Client platform",

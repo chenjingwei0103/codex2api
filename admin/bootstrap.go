@@ -2,6 +2,9 @@ package admin
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
+	"log"
 	"net"
 	"net/http"
 	"os"
@@ -22,7 +25,7 @@ import (
 
 // bootstrapState 跟踪初始化端点的运行状态，主要用于：
 //  1. 防止并发条件下重复写入；
-//  2. 简单的全局限频，避免被扫描器穷举攻击。
+//  2. 简单的全局限频，只统计令牌错误的请求，避免被扫描器穷举。
 var bootstrapState struct {
 	mu sync.Mutex
 
@@ -31,12 +34,69 @@ var bootstrapState struct {
 	count       atomic.Int64
 }
 
+// bootstrapTokenState 持有页面初始化所需的一次性令牌。令牌只存在于进程内存，
+// 生成时打印到服务日志：能完成初始化的必须是能读到服务端日志的部署者，而不是
+// "来源 IP 看起来像内网"的任何人——Docker Desktop / rootless 容器的端口转发和
+// 私网反代都会把公网请求的来源变成私网地址。
+var bootstrapTokenState struct {
+	mu    sync.Mutex
+	token string
+}
+
 const (
-	bootstrapWindowSec = 60
-	bootstrapMaxPerWin = 20
-	bootstrapMinSecret = 8
-	bootstrapMaxSecret = 256
+	bootstrapWindowSec  = 60
+	bootstrapMaxPerWin  = 20
+	bootstrapMinSecret  = 8
+	bootstrapMaxSecret  = 256
+	bootstrapTokenBytes = 16
 )
+
+// EnsureBootstrapToken 返回当前的一次性初始化令牌，尚未生成时生成并打印到日志。
+// 令牌在初始化成功后作废；之后若管理密钥被清空、再次进入待初始化状态，会重新生成。
+func EnsureBootstrapToken() (string, error) {
+	bootstrapTokenState.mu.Lock()
+	defer bootstrapTokenState.mu.Unlock()
+	if bootstrapTokenState.token != "" {
+		return bootstrapTokenState.token, nil
+	}
+	buf := make([]byte, bootstrapTokenBytes)
+	if _, err := rand.Read(buf); err != nil {
+		return "", err
+	}
+	bootstrapTokenState.token = hex.EncodeToString(buf)
+	log.Printf("[bootstrap] 初始化令牌 (bootstrap token): %s", bootstrapTokenState.token)
+	log.Println("[bootstrap] 首次初始化页面需要填写该令牌；仅当前进程有效，重启后重新生成，初始化成功后立即作废。")
+	return bootstrapTokenState.token, nil
+}
+
+// bootstrapTokenMatches 以常量时间比较提交的令牌。令牌尚未生成时一律不匹配。
+func bootstrapTokenMatches(submitted string) bool {
+	submitted = strings.ToLower(strings.TrimSpace(submitted))
+	bootstrapTokenState.mu.Lock()
+	defer bootstrapTokenState.mu.Unlock()
+	if bootstrapTokenState.token == "" || submitted == "" {
+		return false
+	}
+	return security.SecureCompare(submitted, bootstrapTokenState.token)
+}
+
+// revokeBootstrapToken 在初始化成功后作废令牌。
+func revokeBootstrapToken() {
+	bootstrapTokenState.mu.Lock()
+	bootstrapTokenState.token = ""
+	bootstrapTokenState.mu.Unlock()
+}
+
+// bootstrapAuditIP 生成审计日志里的来源字段：ip 是直连对端，与按可信代理解析出的
+// 客户端 IP 不同时额外记 forwarded，便于事后区分真实对端与转发头声称的地址。
+func bootstrapAuditIP(c *gin.Context) string {
+	peer := c.RemoteIP()
+	forwarded := c.ClientIP()
+	if forwarded == "" || forwarded == peer {
+		return "ip=" + peer
+	}
+	return "ip=" + peer + " forwarded=" + forwarded
+}
 
 // bootstrapAllowRate 使用 CAS 实现固定窗口限频：
 //   - 任意时刻只有一个 goroutine 能成功翻新窗口起点，其它失败者读到的就是
@@ -60,7 +120,10 @@ func bootstrapAllowRate() bool {
 	return newCount <= bootstrapMaxPerWin
 }
 
-// bootstrapAllowClientIP 判断该来源 IP 是否允许执行页面初始化。
+// bootstrapAllowClientIP 判断该来源 IP 是否允许执行页面初始化。调用方必须传入
+// 直连 TCP 对端地址(c.RemoteIP())而不是 c.ClientIP()：后者在对端属于可信代理时
+// 取自 X-Forwarded-For，而私网网段默认可信，请求方可以随意声称自己是内网地址。
+// 这道门只是纵深防御，真正的授权凭据是一次性初始化令牌。
 //
 // 规则：
 //   - loopback 永远允许；
@@ -244,6 +307,10 @@ func (h *Handler) GetBootstrapStatus(c *gin.Context) {
 		})
 		return
 	}
+	// 运行时清空管理密钥后重新进入待初始化状态时，这里负责补发令牌到日志。
+	if _, err := EnsureBootstrapToken(); err != nil {
+		log.Printf("[bootstrap] 生成初始化令牌失败: %v", err)
+	}
 	c.JSON(http.StatusOK, gin.H{
 		"needs_bootstrap": true,
 		"source":          "empty",
@@ -263,37 +330,73 @@ func (h *Handler) GetSetupHints(c *gin.Context) {
 //
 // 安全约束：
 //  1. 仅在系统未配置 ADMIN_SECRET 时可用，否则一律 409；
-//  2. 通过互斥锁 + 双重检查避免并发写入；
-//  3. 简单全局限频，防止扫描器穷举；
-//  4. 校验最小长度（8 个 rune），避免过弱密钥；
-//  5. 全程审计日志。
+//  2. 必须携带启动日志里的一次性初始化令牌；来源 IP 门按直连对端判断，只作纵深防御；
+//  3. 通过互斥锁 + 双重检查避免并发写入；
+//  4. 令牌错误的请求计入全局限频，令牌正确的请求不受限频影响，扫描器打满限频也挡不住部署者；
+//  5. 校验最小长度（8 个 rune），避免过弱密钥；
+//  6. 全程审计日志。
 func (h *Handler) PostBootstrap(c *gin.Context) {
-	if !bootstrapAllowClientIP(c.ClientIP()) {
-		security.SecurityAuditLog("BOOTSTRAP_REJECTED_IP", "ip="+c.ClientIP())
-		c.JSON(http.StatusForbidden, gin.H{"error": "当前来源 IP (" + c.ClientIP() + ") 不允许执行页面初始化。可任选其一：1) 在 .env 中设置 ADMIN_SECRET 后重建容器，跳过页面初始化直接登录；2) 设置 BOOTSTRAP_ALLOWED_CIDR 环境变量放行你的来源网段（如 BOOTSTRAP_ALLOWED_CIDR=203.0.113.0/24）。"})
-		return
-	}
-
-	if !bootstrapAllowRate() {
-		security.SecurityAuditLog("BOOTSTRAP_RATE_LIMITED", "ip="+c.ClientIP())
-		c.JSON(http.StatusTooManyRequests, gin.H{"error": "请求过于频繁，请稍后再试"})
+	auditIP := bootstrapAuditIP(c)
+	if peer := c.RemoteIP(); !bootstrapAllowClientIP(peer) {
+		security.SecurityAuditLog("BOOTSTRAP_REJECTED_IP", auditIP)
+		c.JSON(http.StatusForbidden, gin.H{
+			"error": "当前来源 IP (" + peer + ") 不允许执行页面初始化。可任选其一：1) 在 .env 中设置 ADMIN_SECRET 后重建容器，跳过页面初始化直接登录；2) 设置 BOOTSTRAP_ALLOWED_CIDR 环境变量放行该来源网段（如 BOOTSTRAP_ALLOWED_CIDR=203.0.113.0/24）。该判断只看与服务直连的 TCP 对端，不读取 X-Forwarded-For；经反向代理访问时请放行反代所在网段。",
+			"code":  "bootstrap_ip_forbidden",
+		})
 		return
 	}
 
 	envSecret := strings.TrimSpace(h.adminSecretEnv)
 	if envSecret != "" {
-		security.SecurityAuditLog("BOOTSTRAP_REJECTED_ENV", "ip="+c.ClientIP())
+		security.SecurityAuditLog("BOOTSTRAP_REJECTED_ENV", auditIP)
 		c.JSON(http.StatusConflict, gin.H{
 			"error": "ADMIN_SECRET 已通过环境变量配置，无需在页面初始化",
 		})
 		return
 	}
 
+	// 先确认确实处于待初始化状态再校验令牌：已初始化时令牌早已作废，直接回 409
+	// 比回"令牌无效"更准确；这一信息 bootstrap-status 本来就公开。
+	preCtx, preCancel := context.WithTimeout(c.Request.Context(), 3*time.Second)
+	current, err := h.db.GetSystemSettings(preCtx)
+	preCancel()
+	if err != nil {
+		security.SecurityAuditLog("BOOTSTRAP_DB_READ_ERROR", auditIP+" err="+err.Error())
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "读取系统设置失败"})
+		return
+	}
+	if current != nil && strings.TrimSpace(current.AdminSecret) != "" {
+		security.SecurityAuditLog("BOOTSTRAP_REJECTED_ALREADY_INITIALIZED", auditIP)
+		c.JSON(http.StatusConflict, gin.H{
+			"error": "ADMIN_SECRET 已配置，无法重复初始化。如需重置，请进入「设置」页面使用现有密钥登录后修改。",
+		})
+		return
+	}
+	if _, err := EnsureBootstrapToken(); err != nil {
+		security.SecurityAuditLog("BOOTSTRAP_TOKEN_ERROR", auditIP+" err="+err.Error())
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "生成初始化令牌失败"})
+		return
+	}
+
 	var body struct {
-		AdminSecret string `json:"admin_secret"`
+		AdminSecret    string `json:"admin_secret"`
+		BootstrapToken string `json:"bootstrap_token"`
 	}
 	if err := c.ShouldBindJSON(&body); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "请求体格式错误"})
+		return
+	}
+	if !bootstrapTokenMatches(body.BootstrapToken) {
+		if !bootstrapAllowRate() {
+			security.SecurityAuditLog("BOOTSTRAP_RATE_LIMITED", auditIP)
+			c.JSON(http.StatusTooManyRequests, gin.H{"error": "请求过于频繁，请稍后再试"})
+			return
+		}
+		security.SecurityAuditLog("BOOTSTRAP_REJECTED_TOKEN", auditIP)
+		c.JSON(http.StatusUnauthorized, gin.H{
+			"error": "初始化令牌无效。请在服务日志中搜索 bootstrap token 获取令牌（例如 docker compose logs codex2api | grep \"bootstrap token\"）；重启服务会生成新令牌。",
+			"code":  "bootstrap_token_invalid",
+		})
 		return
 	}
 	secret := strings.TrimSpace(body.AdminSecret)
@@ -321,12 +424,12 @@ func (h *Handler) PostBootstrap(c *gin.Context) {
 	// 双重检查：进入临界区后再读一次，避免并发写入
 	settings, err := h.db.GetSystemSettings(ctx)
 	if err != nil {
-		security.SecurityAuditLog("BOOTSTRAP_DB_READ_ERROR", "ip="+c.ClientIP()+" err="+err.Error())
+		security.SecurityAuditLog("BOOTSTRAP_DB_READ_ERROR", auditIP+" err="+err.Error())
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "读取系统设置失败"})
 		return
 	}
 	if settings != nil && strings.TrimSpace(settings.AdminSecret) != "" {
-		security.SecurityAuditLog("BOOTSTRAP_REJECTED_ALREADY_INITIALIZED", "ip="+c.ClientIP())
+		security.SecurityAuditLog("BOOTSTRAP_REJECTED_ALREADY_INITIALIZED", auditIP)
 		c.JSON(http.StatusConflict, gin.H{
 			"error": "ADMIN_SECRET 已配置，无法重复初始化。如需重置，请进入「设置」页面使用现有密钥登录后修改。",
 		})
@@ -338,12 +441,13 @@ func (h *Handler) PostBootstrap(c *gin.Context) {
 	settings.AdminSecret = secret
 
 	if err := h.db.UpdateSystemSettings(ctx, settings); err != nil {
-		security.SecurityAuditLog("BOOTSTRAP_DB_WRITE_ERROR", "ip="+c.ClientIP()+" err="+err.Error())
+		security.SecurityAuditLog("BOOTSTRAP_DB_WRITE_ERROR", auditIP+" err="+err.Error())
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "写入系统设置失败"})
 		return
 	}
 
-	security.SecurityAuditLog("BOOTSTRAP_SUCCESS", "ip="+c.ClientIP())
+	revokeBootstrapToken()
+	security.SecurityAuditLog("BOOTSTRAP_SUCCESS", auditIP)
 	c.JSON(http.StatusOK, gin.H{"ok": true})
 }
 

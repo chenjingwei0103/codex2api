@@ -710,6 +710,14 @@ func (h *Handler) Messages(c *gin.Context) {
 				sendAnthropicError(c, http.StatusTooManyRequests, "rate_limit_error", "All accounts rate limited")
 				return
 			}
+			if lastFailureModelUnsupported(lastStatusCode, lastBody) {
+				msg := usageLogErrorMessage(lastStatusCode, lastBody)
+				if isStream && writeCommittedAnthropicRetryError(c, ErrorTypeInvalidRequest, msg) {
+					return
+				}
+				sendAnthropicError(c, http.StatusBadRequest, ErrorTypeInvalidRequest, msg)
+				return
+			}
 			// 候选被 scope 预算剔空时给出真实原因（issue #439）。
 			if msg := scopeBudgetExhaustedMessage(c); msg != "" {
 				if isStream && writeCommittedAnthropicRetryError(c, "rate_limit_error", msg) {
@@ -724,6 +732,13 @@ func (h *Handler) Messages(c *gin.Context) {
 					return
 				}
 				sendAnthropicError(c, http.StatusServiceUnavailable, "overloaded_error", concurrencySaturatedMessageEN)
+				return
+			}
+			if msg, ok := h.unsupportedModelPoolMessage(apiKeyID, retryExclusions.ForSelection(), effectiveModel, auth.DispatchPolicyStandard); ok {
+				if isStream && writeCommittedAnthropicRetryError(c, ErrorTypeInvalidRequest, msg) {
+					return
+				}
+				sendAnthropicError(c, http.StatusBadRequest, ErrorTypeInvalidRequest, msg)
 				return
 			}
 			if isStream && writeCommittedAnthropicRetryError(c, "overloaded_error", noAvailableAnthropicAccountMessage(effectiveModel)) {
@@ -1080,7 +1095,7 @@ func (h *Handler) Messages(c *gin.Context) {
 					log.Printf("Antigravity OAuth refresh failed after upstream 401 (account=%d, endpoint=/v1/messages): %v", account.ID(), refreshErr)
 				}
 			}
-			if kind := classifyHTTPFailure(resp.StatusCode); kind != "" && !antigravityNonPenalizingUpstreamFailure(account, resp.StatusCode, errBody) {
+			if kind := classifyHTTPFailure(resp.StatusCode, errBody); kind != "" && !antigravityNonPenalizingUpstreamFailure(account, resp.StatusCode, errBody) {
 				h.store.ReportRequestFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
 			}
 			// Claude 的 429 credits_required 是模型级计费门槛:只冷却该模型,不按账号级限流处理

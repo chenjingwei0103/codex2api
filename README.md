@@ -310,6 +310,7 @@ Each successful budget change receives a read-only generation and is polled by e
 - Admin Secret priority:
   - If `ADMIN_SECRET` is set in `.env`, the environment variable wins.
   - Otherwise, the database `AdminSecret` value is used.
+  - If neither is set, `/admin` opens the first-run setup page. It requires the one-time bootstrap token printed in the service log (`docker compose logs codex2api | grep "bootstrap token"`); the token is per-process, regenerated on restart, and revoked once setup succeeds.
   - After login, the frontend sends `X-Admin-Key` when calling `/api/admin/*`.
 
 ---
